@@ -376,16 +376,12 @@ def cleanup_jobs() -> None:
 
 
 def check_rate(ip: str, weight: int = 1) -> bool:
-    # 30 weighted hits per IP per 10 minutes. A download costs 3, so this
-    # allows 10 downloads per window: 15 was too easy to hit by tapping
-    # MP4/MP3 a few times while testing on a phone (2026-11-09).
-    with LOCK:
-        hits = RATE.setdefault(ip, [])
-        hits[:] = [v for v in hits if time.time() - v < 600]
-        if len(hits) + weight > 30:
-            return False
-        hits.extend([time.time()] * weight)
-        return True
+    # Rate limiting DISABLED at Him's request (2026-11-09): nobody else
+    # uses this service, so the 429 limit only got in his way. The call
+    # site is kept (and the 501-safe body-read order with it) so the limit
+    # can be restored by putting the check back here; the regression tests
+    # still exercise the 429 path by mocking this function.
+    return True
 
 
 class App(BaseHTTPRequestHandler):
@@ -393,7 +389,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.1"
+    server_version = "HimTik/2.0.2"
     sys_version = ""
 
     def log_message(self, fmt, *args):

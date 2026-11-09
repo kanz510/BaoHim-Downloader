@@ -12,7 +12,7 @@ V2 ưu tiên tốc độ: video được **truyền trực tiếp (stream)** t�
 - **V2 — video stream trực tiếp:** `POST /api/download` (video) trả job `ready` kèm `stream_url` ngay khi tìm được link MP4 trực tiếp; trình duyệt mở `GET /api/stream/{id}` và nhận video theo luồng, không chờ máy chủ tải xong. Stream chạy bằng yt-dlp được nạp sẵn metadata đã cache (`--load-info-json`) nên mỗi link chỉ trích xuất một lần — không thử tải trực tiếp link CDN bằng HTTP thường nữa vì TikTok chặn kiểu tải đó từ IP máy chủ. Nếu stream lỗi thì server trả `fallback: "full"` để client dùng bản tải đầy đủ (`/api/files/{id}`).
 - **V2 — cache metadata:** mỗi link chỉ chạy `yt-dlp --dump-single-json` một lần trong 10 phút; lần tải lại sau dùng cache.
 - Hàng đợi tải, trạng thái và thông báo lỗi; tệp tạm tự xóa sau khoảng 20 phút.
-- Chỉ cho phép link TikTok/Douyin; giới hạn 120 MB/tệp, giới hạn tốc độ đơn giản, không lấy thông tin đăng nhập.
+- Chỉ cho phép link TikTok/Douyin; giới hạn 120 MB/tệp, không giới hạn tốc độ, không lấy thông tin đăng nhập.
 
 **Không hỗ trợ trong V2:** album ảnh/slideshow, hàng loạt, video riêng tư, lưu trực tiếp vào Thư viện Ảnh iPhone (iOS bắt buộc thao tác Chia sẻ → Lưu video), cam kết tải không logo/4K mọi bài đăng, tua/seek (Range) khi xem stream. Nguồn media phụ thuộc yt-dlp và mức truy cập TikTok/Douyin tại thời điểm chạy.
 
