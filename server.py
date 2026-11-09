@@ -4,10 +4,13 @@ For TikTok/Douyin public posts only. Doesn't claim guaranteed no-watermark acces
 
 V2: video downloads prefer direct streaming. POST /api/download first resolves the
 post's direct MP4 URL (cached metadata) and returns a ready stream job; the client
-then fetches GET /api/stream/<job> and the server pipes the CDN bytes straight
-through without saving the file on Render. When no direct MP4 is available, or
-streaming fails, the client falls back to the original full-download job
-(GET /api/files/<job>). Audio (MP3) always uses the full-download path.
+then fetches GET /api/stream/<job> and the server pipes the video straight through
+without saving the file on Render. The stream runs yt-dlp fed by the cached
+extraction (--load-info-json), so a link is extracted only once per 10 minutes:
+plain fetches of TikTok's CDN URLs are refused from server IPs, so trying them
+first only wasted time. When no direct MP4 is available, or streaming fails, the
+client falls back to the original full-download job (GET /api/files/<job>).
+Audio (MP3) always uses the full-download path.
 """
 from __future__ import annotations
 
@@ -125,10 +128,31 @@ def inspect_media(url: str, force: bool = False) -> dict:
         "http_headers": info.get("http_headers") or {},
     }
     with LOCK:
-        META_CACHE[url] = {"created": now, "info": parsed}
+        META_CACHE[url] = {"created": now, "info": parsed, "raw": info}
         while len(META_CACHE) > META_CACHE_MAX:
             META_CACHE.pop(next(iter(META_CACHE)), None)
     return parsed
+
+
+def raw_info_for(url: str) -> dict | None:
+    """Full yt-dlp info dict for a link, from the metadata cache if fresh.
+
+    Falls back to a (single) fresh extraction when the cache has nothing
+    usable. The stream pipe feeds this to yt-dlp via --load-info-json so
+    it can start downloading without extracting the post a second time.
+    """
+    now = time.time()
+    with LOCK:
+        hit = META_CACHE.get(url)
+        if hit and now - hit["created"] < META_CACHE_TTL_SECONDS:
+            raw = hit.get("raw")
+            if isinstance(raw, dict) and raw.get("formats"):
+                return raw
+    inspect_media(url, force=True)
+    with LOCK:
+        hit = META_CACHE.get(url)
+        raw = hit.get("raw") if hit else None
+        return raw if isinstance(raw, dict) and raw.get("formats") else None
 
 
 def public_info(info: dict) -> dict:
@@ -229,7 +253,12 @@ class _ValidatedRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def open_direct(url: str, headers: dict):
-    """Open a validated direct media URL with yt-dlp's headers."""
+    """Open a validated direct media URL with yt-dlp's headers.
+
+    Retained for a future direct-fetch fast path: the stream handler
+    currently goes through the yt-dlp pipe instead, because TikTok's CDN
+    refuses plain fetches from server IPs.
+    """
     if not validate_stream_url(url):
         raise urllib.error.URLError("direct URL failed validation")
     safe = {k: str(v) for k, v in (headers or {}).items()
@@ -239,16 +268,29 @@ def open_direct(url: str, headers: dict):
     return opener.open(req, timeout=STREAM_READ_TIMEOUT)
 
 
-def open_ytdlp_pipe(url: str):
+def open_ytdlp_pipe(url: str, raw_info: dict | None = None):
     """Let yt-dlp itself fetch the media and pipe it to stdout.
 
     Last-resort stream source: yt-dlp's own downloader is proven to work
     from this host even when a plain urllib fetch of the same CDN URL is
-    refused. Returns (readable, close_fn); the caller validates the first
-    bytes before sending any response headers.
+    refused. When the cached extraction (raw_info) is given, yt-dlp is fed
+    it via --load-info-json and starts downloading immediately instead of
+    extracting the post a second time (~10 s saved on the free tier).
+    Returns (readable, close_fn); the caller validates the first bytes
+    before sending any response headers.
     """
+    info_path = None
+    cmd = ytdlp_base()
+    if isinstance(raw_info, dict) and raw_info.get("formats"):
+        try:
+            fd, info_path = tempfile.mkstemp(prefix="himtik-info-", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(raw_info, handle)
+            cmd += ["--load-info-json", info_path]
+        except (OSError, ValueError, TypeError):
+            info_path = None
     proc = subprocess.Popen(
-        ytdlp_base() + ["-f", "best[ext=mp4]/best", "--no-playlist", "-o", "-", url],
+        cmd + ["-f", "best[ext=mp4]/best", "--no-playlist", "-o", "-", url],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     def close_fn():
         try:
@@ -260,6 +302,11 @@ def open_ytdlp_pipe(url: str):
             proc.wait(timeout=5)
         except Exception:
             pass
+        if info_path:
+            try:
+                os.unlink(info_path)
+            except OSError:
+                pass
     return proc.stdout, close_fn
 
 
@@ -435,59 +482,32 @@ class App(BaseHTTPRequestHandler):
     def handle_stream(self, jid):
         """Pipe a stream job's video to the client without saving it.
 
-        Sources are tried in order: the cached direct MP4 URLs (several CDN
-        hosts can serve the same video), one refreshed URL, then yt-dlp
-        itself piping the media to stdout (its downloader is proven to work
-        from this host even when a plain fetch of the same CDN URL is
-        refused). The first bytes (MP4 magic) are validated before any
+        Plain fetches of TikTok's CDN URLs are refused from server IPs
+        (verified repeatedly), so no direct-URL attempt is made here: the
+        stream goes straight to yt-dlp, fed the cached extraction via
+        --load-info-json, so the post is extracted once per link instead
+        of twice. The first bytes (MP4 magic) are validated before any
         response headers are sent, so a bad source still returns a JSON
-        error. If every source fails the client is told to use the
+        error. If the pipe fails the client is told to use the
         full-download fallback.
         """
         with LOCK:
             job = JOBS.get(jid)
             if not job or job.get("mode") != "stream":
                 return self.json_response(404, {"error": "Phiên truyền trực tiếp không tồn tại hoặc đã hết hạn."})
-            candidates = list(job.get("direct_list") or ([job["direct"]] if job.get("direct") else []))
             source_url = job.get("source_url") or ""
-            job_created = job.get("created") or time.time()
         started = time.monotonic()
         source = None          # object with .read(n)
         close_source = None    # callable to release it
-        content_length = None
         first = b""
         last_error = ""
 
-        def try_http(direct):
-            nonlocal content_length, first
-            resp = open_direct(direct["url"], direct.get("http_headers") or {})
-            try:
-                declared = resp.headers.get("Content-Length")
-                if declared is not None:
-                    try:
-                        content_length = int(declared)
-                    except ValueError:
-                        content_length = None
-                    if content_length is not None and not 0 < content_length <= MAX_BYTES:
-                        raise ValueError("Tệp quá lớn; giới hạn hiện tại là 120 MB.")
-                chunk = resp.read(32 * 1024)
-                if not chunk:
-                    raise ValueError("Nguồn video không trả dữ liệu.")
-                if not is_mp4_prefix(chunk):
-                    raise ValueError("Nguồn video không đúng định dạng MP4.")
-                first = chunk
-                return resp
-            except Exception:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-                raise
-
         def try_pipe():
             nonlocal first
-            stream, close_fn = open_ytdlp_pipe(source_url)
+            raw = raw_info_for(source_url)
+            close_fn = None
             try:
+                stream, close_fn = open_ytdlp_pipe(source_url, raw)
                 ready, _, _ = select.select([stream], [], [], 60)
                 if not ready:
                     raise TimeoutError("yt-dlp pipe produced no data in time")
@@ -499,49 +519,16 @@ class App(BaseHTTPRequestHandler):
                 first = chunk
                 return stream, close_fn
             except Exception:
-                try:
-                    close_fn()
-                except Exception:
-                    pass
+                if close_fn is not None:
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
                 raise
 
-        for idx, direct in enumerate(candidates[:5]):
-            try:
-                source = try_http(direct)
-                close_source = lambda s=source: s.close()
-                print(f"[timing] stream candidate {idx + 1} ok format={direct.get('format_id')}", flush=True)
-                break
-            except Exception as exc:  # noqa: BLE001 - a failed candidate just means try the next
-                last_error = type(exc).__name__
-                print(f"[timing] stream candidate {idx + 1} failed: {last_error}", flush=True)
-                source = None
-                content_length = None
-                first = b""
-        if source is None and time.time() - job_created > META_CACHE_TTL_SECONDS:
-            # Only refresh when the job is older than the metadata cache: on
-            # a fresh job a 403 means the CDN refuses this client, not that
-            # the links expired, so a re-extract would return the same URLs.
-            try:
-                fresh_list = pick_direct_list(inspect_media(source_url, force=True))
-                if fresh_list:
-                    direct = fresh_list[0]
-                    with LOCK:
-                        if jid in JOBS:
-                            JOBS[jid]["direct"] = direct
-                            JOBS[jid]["direct_list"] = fresh_list
-                    source = try_http(direct)
-                    close_source = lambda s=source: s.close()
-                    print("[timing] stream refreshed candidate ok", flush=True)
-            except Exception as exc:  # noqa: BLE001 - refresh failure means try the pipe
-                last_error = type(exc).__name__
-                print(f"[timing] stream refresh failed: {last_error}", flush=True)
-                source = None
-                content_length = None
-                first = b""
-        if source is None and source_url:
+        if source_url:
             try:
                 source, close_source = try_pipe()
-                content_length = None
                 print("[timing] stream yt-dlp pipe ok", flush=True)
             except Exception as exc:  # noqa: BLE001 - pipe failure means fall back
                 last_error = type(exc).__name__
@@ -555,8 +542,6 @@ class App(BaseHTTPRequestHandler):
         name = "HimTik-" + jid[:8] + ".mp4"
         self.send_response(200)
         self.send_header("Content-Type", "video/mp4")
-        if content_length is not None:
-            self.send_header("Content-Length", str(content_length))
         self.send_header("Content-Disposition", f'inline; filename="{name}"')
         self.headers_common()
         self.end_headers()

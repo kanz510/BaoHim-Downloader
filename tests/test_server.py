@@ -8,7 +8,7 @@ from http.server import ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import server
@@ -36,24 +36,6 @@ def fake_info():
              "url": "https://v16-webapp-prime.us.tiktok.com/list.m3u8"},
         ],
     }
-
-
-class FakeStreamResponse:
-    def __init__(self, chunks, content_length=None):
-        self._data = b"".join(chunks)
-        self._pos = 0
-        self.headers = {"Content-Length": str(content_length)} if content_length is not None else {}
-
-    def read(self, n=-1):
-        if self._pos >= len(self._data):
-            return b""
-        end = len(self._data) if n < 0 else min(len(self._data), self._pos + n)
-        out = self._data[self._pos:end]
-        self._pos = end
-        return out
-
-    def close(self):
-        pass
 
 
 class UrlTests(unittest.TestCase):
@@ -135,6 +117,26 @@ class UrlTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         server.inspect_media(url, force=True)
         self.assertEqual(run.call_count, 2)
+        self.assertIn('raw', server.META_CACHE[url])
+
+    @patch('server.subprocess.Popen')
+    def test_pipe_uses_load_info_json(self, popen):
+        raw = {"id": "123", "formats": fake_info()["formats"]}
+        stream, close_fn = server.open_ytdlp_pipe('https://www.tiktok.com/@abc/video/123', raw)
+        cmd = popen.call_args[0][0]
+        self.assertIn('--load-info-json', cmd)
+        info_path = cmd[cmd.index('--load-info-json') + 1]
+        with open(info_path) as handle:
+            self.assertEqual(json.load(handle), raw)
+        self.assertIn('https://www.tiktok.com/@abc/video/123', cmd)
+        close_fn()
+        self.assertFalse(os.path.exists(info_path))
+
+    @patch('server.subprocess.Popen')
+    def test_pipe_without_raw_uses_plain_url(self, popen):
+        server.open_ytdlp_pipe('https://www.tiktok.com/@abc/video/123')
+        cmd = popen.call_args[0][0]
+        self.assertNotIn('--load-info-json', cmd)
 
 
 class HttpTests(unittest.TestCase):
@@ -237,96 +239,73 @@ class HttpTests(unittest.TestCase):
                                 'source_url': 'https://www.tiktok.com/@abc/video/123'}
         return jid
 
-    @patch('server.open_direct')
-    def test_stream_serves_mp4(self, mock_open):
-        jid = self._stream_job()
-        payload = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00' + b'0123456789' * 8
-        mock_open.return_value = FakeStreamResponse([payload], content_length=len(payload))
-        status, body, headers = self.request('/api/stream/' + jid)
-        self.assertEqual(status, 200)
-        self.assertEqual(body, payload)
-        self.assertEqual(headers.get('Content-Type'), 'video/mp4')
-        self.assertIn('inline', headers.get('Content-Disposition'))
-        self.assertEqual(headers.get('Content-Length'), str(len(payload)))
+    def _seed_raw_cache(self, url='https://www.tiktok.com/@abc/video/123'):
+        raw = {"id": "123", "formats": fake_info()["formats"],
+               "webpage_url": url, "extractor_key": "TikTok"}
+        with server.LOCK:
+            server.META_CACHE[url] = {"created": time.time(), "info": fake_info(), "raw": raw}
+        return raw
 
-    @patch('server.inspect_media')
-    @patch('server.open_direct')
-    @patch('server.open_ytdlp_pipe')
-    def test_stream_rejects_non_mp4(self, mock_pipe, mock_open, mock_inspect):
-        jid = self._stream_job()
-        mock_open.return_value = FakeStreamResponse([b'<html>not a video</html>'])
-        mock_inspect.return_value = {'formats': []}  # refresh finds no direct URL
-        mock_pipe.side_effect = RuntimeError('yt-dlp unavailable')
-        status, body, _ = self.request('/api/stream/' + jid)
-        self.assertEqual(status, 502)
-        self.assertEqual(json.loads(body)['fallback'], 'full')
-
-    @patch('server.inspect_media')
-    @patch('server.open_direct')
-    @patch('server.open_ytdlp_pipe')
-    def test_stream_refresh_then_fallback(self, mock_pipe, mock_open, mock_inspect):
-        # Fresh job: the refresh is skipped (a 403 means blocked, not expired).
-        jid = self._stream_job()
-        mock_open.side_effect = URLError('blocked')
-        mock_pipe.side_effect = RuntimeError('yt-dlp unavailable')
-        status, body, _ = self.request('/api/stream/' + jid)
-        self.assertEqual(status, 502)
-        self.assertEqual(json.loads(body)['fallback'], 'full')
-        self.assertEqual(mock_open.call_count, 1)
-        mock_inspect.assert_not_called()
-        mock_pipe.assert_called_once()
-
-    @patch('server.inspect_media')
-    @patch('server.open_direct')
-    @patch('server.open_ytdlp_pipe')
-    def test_stream_refreshes_stale_job(self, mock_pipe, mock_open, mock_inspect):
-        # Job older than the metadata cache: the refresh runs before the pipe.
-        jid = self._stream_job(age_seconds=601)
-        mock_open.side_effect = URLError('blocked')
-        mock_inspect.return_value = {'formats': []}  # refresh finds no direct URL
-        mock_pipe.side_effect = RuntimeError('yt-dlp unavailable')
-        status, body, _ = self.request('/api/stream/' + jid)
-        self.assertEqual(status, 502)
-        self.assertEqual(json.loads(body)['fallback'], 'full')
-        mock_inspect.assert_called_once()
-        mock_pipe.assert_called_once()
-
-    @patch('server.inspect_media')
-    @patch('server.open_direct')
-    @patch('server.open_ytdlp_pipe')
-    def test_stream_falls_back_to_ytdlp_pipe(self, mock_pipe, mock_open, mock_inspect):
-        jid = self._stream_job()
-        mock_open.side_effect = URLError('blocked')
-        mock_inspect.return_value = {'formats': []}  # refresh finds no direct URL
-        payload = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00' + b'0123456789' * 8
+    def _pipe_stream(self, payload):
         read_fd, write_fd = os.pipe()
         os.write(write_fd, payload)
         os.close(write_fd)
-        stream = os.fdopen(read_fd, 'rb')
+        return os.fdopen(read_fd, 'rb')
+
+    @patch('server.open_ytdlp_pipe')
+    @patch('server.inspect_media')
+    def test_stream_serves_mp4_via_pipe(self, mock_inspect, mock_pipe):
+        jid = self._stream_job()
+        raw = self._seed_raw_cache()
+        payload = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00' + b'0123456789' * 8
+        stream = self._pipe_stream(payload)
         mock_pipe.return_value = (stream, lambda: stream.close())
         status, body, headers = self.request('/api/stream/' + jid)
         self.assertEqual(status, 200)
         self.assertEqual(body, payload)
         self.assertEqual(headers.get('Content-Type'), 'video/mp4')
         self.assertIsNone(headers.get('Content-Length'))  # the pipe has no declared length
+        mock_inspect.assert_not_called()  # cached raw info: no second extraction
+        mock_pipe.assert_called_once()
+        self.assertEqual(mock_pipe.call_args[0][1], raw)
 
-    @patch('server.open_direct')
-    def test_stream_tries_next_candidate(self, mock_open):
+    @patch('server.open_ytdlp_pipe')
+    def test_stream_rejects_non_mp4(self, mock_pipe):
         jid = self._stream_job()
-        with server.LOCK:
-            server.JOBS[jid]["direct_list"] = [
-                {"url": "https://v16-webapp-prime.us.tiktok.com/blocked.mp4",
-                 "format_id": "download", "filesize": None, "http_headers": {}},
-                {"url": "https://v19-webapp-prime.us.tiktok.com/h264.mp4",
-                 "format_id": "h264_540p_136145-1", "filesize": 100, "http_headers": {}},
-            ]
+        self._seed_raw_cache()
+        stream = self._pipe_stream(b'<html>not a video</html>')
+        mock_pipe.return_value = (stream, lambda: stream.close())
+        status, body, _ = self.request('/api/stream/' + jid)
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body)['fallback'], 'full')
+
+    @patch('server.open_ytdlp_pipe')
+    def test_stream_pipe_failure_returns_502(self, mock_pipe):
+        jid = self._stream_job()
+        self._seed_raw_cache()
+        mock_pipe.side_effect = RuntimeError('yt-dlp unavailable')
+        status, body, _ = self.request('/api/stream/' + jid)
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body)['fallback'], 'full')
+
+    @patch('server.open_ytdlp_pipe')
+    @patch('server.inspect_media')
+    def test_stream_reextracts_when_cache_empty(self, mock_inspect, mock_pipe):
+        jid = self._stream_job()
+        raw = {"id": "123", "formats": fake_info()["formats"]}
+        def seed(url, force=False):
+            with server.LOCK:
+                server.META_CACHE[url] = {"created": time.time(), "info": fake_info(), "raw": raw}
+            return fake_info()
+        mock_inspect.side_effect = seed
         payload = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00' + b'0123456789' * 8
-        mock_open.side_effect = [URLError('blocked'),
-                                 FakeStreamResponse([payload], content_length=len(payload))]
-        status, body, headers = self.request('/api/stream/' + jid)
+        stream = self._pipe_stream(payload)
+        mock_pipe.return_value = (stream, lambda: stream.close())
+        status, body, _ = self.request('/api/stream/' + jid)
         self.assertEqual(status, 200)
         self.assertEqual(body, payload)
-        self.assertEqual(mock_open.call_count, 2)
+        mock_inspect.assert_called_once()
+        self.assertEqual(mock_pipe.call_args[0][1], raw)
 
     def test_stream_unknown_job(self):
         status, body, _ = self.request('/api/stream/nope')
