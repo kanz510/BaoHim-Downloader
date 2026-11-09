@@ -376,10 +376,13 @@ def cleanup_jobs() -> None:
 
 
 def check_rate(ip: str, weight: int = 1) -> bool:
+    # 30 weighted hits per IP per 10 minutes. A download costs 3, so this
+    # allows 10 downloads per window: 15 was too easy to hit by tapping
+    # MP4/MP3 a few times while testing on a phone (2026-11-09).
     with LOCK:
         hits = RATE.setdefault(ip, [])
         hits[:] = [v for v in hits if time.time() - v < 600]
-        if len(hits) + weight > 15:
+        if len(hits) + weight > 30:
             return False
         hits.extend([time.time()] * weight)
         return True
