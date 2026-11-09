@@ -1,6 +1,6 @@
 """HimTik: small standard-library HTTP service that delegates media extraction to yt-dlp.
 
-For TikTok/Douyin public posts only. Doesn't claim guaranteed no-watermark access.
+For TikTok/Douyin/Facebook/Instagram public posts only. Doesn't claim guaranteed no-watermark access.
 
 V2: video downloads prefer direct streaming. POST /api/download first resolves the
 post's direct MP4 URL (cached metadata) and returns a ready stream job; the client
@@ -65,11 +65,11 @@ def extract_url(raw: str) -> str:
         raise ValueError("Liên kết không hợp lệ.")
     found = URL_RE.search(raw.strip())
     if not found:
-        raise ValueError("Hãy dán liên kết bài đăng TikTok hoặc Douyin.")
+        raise ValueError("Hãy dán liên kết bài đăng TikTok, Douyin, Facebook hoặc Instagram.")
     url = found.group(0).rstrip(".,;!?)]}）。")
     parts = urlsplit(url)
     host = (parts.hostname or "").lower().rstrip(".")
-    allowed = ("tiktok.com", "douyin.com", "iesdouyin.com")
+    allowed = ("tiktok.com", "douyin.com", "iesdouyin.com", "facebook.com", "instagram.com", "fb.watch")
     if (
         parts.scheme not in ("http", "https")
         or parts.username or parts.password
@@ -77,7 +77,7 @@ def extract_url(raw: str) -> str:
         or not any(host == h or host.endswith("." + h) for h in allowed)
         or not parts.path
     ):
-        raise ValueError("Chỉ hỗ trợ liên kết công khai từ TikTok hoặc Douyin.")
+        raise ValueError("Chỉ hỗ trợ liên kết công khai từ TikTok, Douyin, Facebook hoặc Instagram.")
     return url
 
 
@@ -87,6 +87,18 @@ def ytdlp_base() -> list[str]:
         "--no-playlist", "--no-warnings", "--no-progress",
         "--socket-timeout", "12", "--retries", "1", "--fragment-retries", "1",
     ]
+
+
+def _source_label(extractor_key) -> str:
+    """Display platform name from yt-dlp's extractor key."""
+    key = (extractor_key or "").lower()
+    if "douyin" in key:
+        return "Douyin"
+    if "facebook" in key:
+        return "Facebook"
+    if "instagram" in key:
+        return "Instagram"
+    return "TikTok"
 
 
 def inspect_media(url: str, force: bool = False) -> dict:
@@ -123,7 +135,7 @@ def inspect_media(url: str, force: bool = False) -> dict:
         "creator": str(info.get("uploader") or info.get("creator") or "TikTok")[:80],
         "thumbnail": str(info.get("thumbnail") or "")[:1500],
         "duration": info.get("duration") if isinstance(info.get("duration"), (int, float)) else None,
-        "source": "Douyin" if "douyin" in (info.get("extractor_key") or "").lower() else "TikTok",
+        "source": _source_label(info.get("extractor_key")),
         "formats": info.get("formats") or [],
         "http_headers": info.get("http_headers") or {},
     }
@@ -389,7 +401,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.2"
+    server_version = "HimTik/2.0.3"
     sys_version = ""
 
     def log_message(self, fmt, *args):

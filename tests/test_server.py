@@ -52,6 +52,11 @@ class UrlTests(unittest.TestCase):
     def test_douyin(self):
         self.assertEqual(server.extract_url('https://v.douyin.com/abc/'), 'https://v.douyin.com/abc/')
 
+    def test_facebook_instagram(self):
+        self.assertEqual(server.extract_url('https://www.facebook.com/reel/1234567890123456'), 'https://www.facebook.com/reel/1234567890123456')
+        self.assertEqual(server.extract_url('https://fb.watch/abc123/'), 'https://fb.watch/abc123/')
+        self.assertEqual(server.extract_url('https://www.instagram.com/reel/AbCdEfGhIjK/'), 'https://www.instagram.com/reel/AbCdEfGhIjK/')
+
     def test_block_unsafe_domains(self):
         for raw in ('http://localhost/private', 'https://tiktok.com.attacker.test/video', 'https://evil-tiktok.com/video', 'http://127.0.0.1/private', 'file:///etc/passwd', 'https://tiktok.com:9090/a', 'https://other.com/tiktok.com/video'):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
@@ -64,6 +69,13 @@ class UrlTests(unittest.TestCase):
         data = server.inspect_media('https://www.tiktok.com/@abc/video/123')
         self.assertEqual(data['title'], 'Ví dụ')
         self.assertEqual(data['source'], 'TikTok')
+
+    @patch('server.subprocess.run')
+    def test_inspect_facebook_source(self, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({'title':'Ví dụ', 'uploader':'abc', 'duration':29, 'formats':[{'format_id':'x'}], 'extractor_key':'Facebook'})
+        data = server.inspect_media('https://www.facebook.com/reel/123')
+        self.assertEqual(data['source'], 'Facebook')
 
     def test_pick_direct_prefers_download_then_h264(self):
         info = fake_info()
