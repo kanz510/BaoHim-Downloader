@@ -261,16 +261,38 @@ class HttpTests(unittest.TestCase):
 
     @patch('server.inspect_media')
     @patch('server.open_direct')
-    def test_stream_refresh_then_fallback(self, mock_open, mock_inspect):
+    @patch('server.open_ytdlp_pipe')
+    def test_stream_refresh_then_fallback(self, mock_pipe, mock_open, mock_inspect):
         jid = self._stream_job()
         mock_open.side_effect = URLError('blocked')
         mock_inspect.return_value = {'formats': []}  # refresh finds no direct URL
+        mock_pipe.side_effect = RuntimeError('yt-dlp unavailable')
         status, body, _ = self.request('/api/stream/' + jid)
         self.assertEqual(status, 502)
         self.assertEqual(json.loads(body)['fallback'], 'full')
-        # The single-candidate job tries its URL, then the refresh finds nothing.
+        # The single-candidate job tries its URL, then the refresh finds nothing, then the pipe fails.
         self.assertEqual(mock_open.call_count, 1)
         mock_inspect.assert_called_once()
+        mock_pipe.assert_called_once()
+
+    @patch('server.inspect_media')
+    @patch('server.open_direct')
+    @patch('server.open_ytdlp_pipe')
+    def test_stream_falls_back_to_ytdlp_pipe(self, mock_pipe, mock_open, mock_inspect):
+        jid = self._stream_job()
+        mock_open.side_effect = URLError('blocked')
+        mock_inspect.return_value = {'formats': []}  # refresh finds no direct URL
+        payload = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00' + b'0123456789' * 8
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        stream = os.fdopen(read_fd, 'rb')
+        mock_pipe.return_value = (stream, lambda: stream.close())
+        status, body, headers = self.request('/api/stream/' + jid)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, payload)
+        self.assertEqual(headers.get('Content-Type'), 'video/mp4')
+        self.assertIsNone(headers.get('Content-Length'))  # the pipe has no declared length
 
     @patch('server.open_direct')
     def test_stream_tries_next_candidate(self, mock_open):

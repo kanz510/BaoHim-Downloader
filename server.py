@@ -17,6 +17,7 @@ import mimetypes
 import os
 import re
 import secrets
+import select
 import shutil
 import socket
 import subprocess
@@ -238,6 +239,30 @@ def open_direct(url: str, headers: dict):
     return opener.open(req, timeout=STREAM_READ_TIMEOUT)
 
 
+def open_ytdlp_pipe(url: str):
+    """Let yt-dlp itself fetch the media and pipe it to stdout.
+
+    Last-resort stream source: yt-dlp's own downloader is proven to work
+    from this host even when a plain urllib fetch of the same CDN URL is
+    refused. Returns (readable, close_fn); the caller validates the first
+    bytes before sending any response headers.
+    """
+    proc = subprocess.Popen(
+        ytdlp_base() + ["-f", "best[ext=mp4]/best", "--no-playlist", "-o", "-", url],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    def close_fn():
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    return proc.stdout, close_fn
+
+
 def download_media(job_id: str, url: str, file_type: str) -> None:
     folder = STORAGE / job_id
     try:
@@ -408,15 +433,16 @@ class App(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def handle_stream(self, jid):
-        """Pipe a stream job's direct MP4 URL to the client without saving it.
+        """Pipe a stream job's video to the client without saving it.
 
-        Tries the cached direct URLs in order (TikTok serves the same video
-        from several CDN hosts and one host can refuse a client while another
-        serves it). Validates the first bytes (MP4 magic) before sending
-        headers, so a bad source still returns a JSON error. If every cached
-        URL fails, the metadata is refreshed once and the first fresh URL is
-        tried; if that also fails the client is told to use the full-download
-        fallback.
+        Sources are tried in order: the cached direct MP4 URLs (several CDN
+        hosts can serve the same video), one refreshed URL, then yt-dlp
+        itself piping the media to stdout (its downloader is proven to work
+        from this host even when a plain fetch of the same CDN URL is
+        refused). The first bytes (MP4 magic) are validated before any
+        response headers are sent, so a bad source still returns a JSON
+        error. If every source fails the client is told to use the
+        full-download fallback.
         """
         with LOCK:
             job = JOBS.get(jid)
@@ -425,16 +451,17 @@ class App(BaseHTTPRequestHandler):
             candidates = list(job.get("direct_list") or ([job["direct"]] if job.get("direct") else []))
             source_url = job.get("source_url") or ""
         started = time.monotonic()
-        response = None
-        first = b""
+        source = None          # object with .read(n)
+        close_source = None    # callable to release it
         content_length = None
-        tried = 0
+        first = b""
         last_error = ""
-        for direct in candidates[:3]:
-            tried += 1
+
+        def try_http(direct):
+            nonlocal content_length, first
+            resp = open_direct(direct["url"], direct.get("http_headers") or {})
             try:
-                response = open_direct(direct["url"], direct.get("http_headers") or {})
-                declared = response.headers.get("Content-Length")
+                declared = resp.headers.get("Content-Length")
                 if declared is not None:
                     try:
                         content_length = int(declared)
@@ -442,25 +469,54 @@ class App(BaseHTTPRequestHandler):
                         content_length = None
                     if content_length is not None and not 0 < content_length <= MAX_BYTES:
                         raise ValueError("Tệp quá lớn; giới hạn hiện tại là 120 MB.")
-                first = response.read(32 * 1024)
-                if not first:
+                chunk = resp.read(32 * 1024)
+                if not chunk:
                     raise ValueError("Nguồn video không trả dữ liệu.")
-                if not is_mp4_prefix(first):
+                if not is_mp4_prefix(chunk):
                     raise ValueError("Nguồn video không đúng định dạng MP4.")
-                print(f"[timing] stream candidate {tried} ok format={direct.get('format_id')}", flush=True)
+                first = chunk
+                return resp
+            except Exception:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                raise
+
+        def try_pipe():
+            nonlocal first
+            stream, close_fn = open_ytdlp_pipe(source_url)
+            try:
+                ready, _, _ = select.select([stream], [], [], 60)
+                if not ready:
+                    raise TimeoutError("yt-dlp pipe produced no data in time")
+                chunk = stream.read(32 * 1024)
+                if not chunk:
+                    raise ValueError("yt-dlp pipe produced no data")
+                if not is_mp4_prefix(chunk):
+                    raise ValueError("yt-dlp pipe did not produce MP4 data")
+                first = chunk
+                return stream, close_fn
+            except Exception:
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+                raise
+
+        for idx, direct in enumerate(candidates[:5]):
+            try:
+                source = try_http(direct)
+                close_source = lambda s=source: s.close()
+                print(f"[timing] stream candidate {idx + 1} ok format={direct.get('format_id')}", flush=True)
                 break
             except Exception as exc:  # noqa: BLE001 - a failed candidate just means try the next
                 last_error = type(exc).__name__
-                print(f"[timing] stream candidate {tried} failed: {last_error}", flush=True)
-                if response is not None:
-                    try:
-                        response.close()
-                    except Exception:
-                        pass
-                    response = None
+                print(f"[timing] stream candidate {idx + 1} failed: {last_error}", flush=True)
+                source = None
                 content_length = None
                 first = b""
-        if response is None:
+        if source is None:
             # One refresh: the cached links may have expired.
             try:
                 fresh_list = pick_direct_list(inspect_media(source_url, force=True))
@@ -470,28 +526,26 @@ class App(BaseHTTPRequestHandler):
                         if jid in JOBS:
                             JOBS[jid]["direct"] = direct
                             JOBS[jid]["direct_list"] = fresh_list
-                    response = open_direct(direct["url"], direct.get("http_headers") or {})
-                    declared = response.headers.get("Content-Length")
-                    if declared is not None:
-                        try:
-                            content_length = int(declared)
-                        except ValueError:
-                            content_length = None
-                        if content_length is not None and not 0 < content_length <= MAX_BYTES:
-                            raise ValueError("Tệp quá lớn; giới hạn hiện tại là 120 MB.")
-                    first = response.read(32 * 1024)
-                    if not first or not is_mp4_prefix(first):
-                        raise ValueError("Nguồn video không đúng định dạng MP4.")
+                    source = try_http(direct)
+                    close_source = lambda s=source: s.close()
                     print("[timing] stream refreshed candidate ok", flush=True)
-            except Exception as exc:  # noqa: BLE001 - refresh failure means fall back
+            except Exception as exc:  # noqa: BLE001 - refresh failure means try the pipe
                 last_error = type(exc).__name__
-                if response is not None:
-                    try:
-                        response.close()
-                    except Exception:
-                        pass
-                    response = None
-        if response is None:
+                print(f"[timing] stream refresh failed: {last_error}", flush=True)
+                source = None
+                content_length = None
+                first = b""
+        if source is None and source_url:
+            try:
+                source, close_source = try_pipe()
+                content_length = None
+                print("[timing] stream yt-dlp pipe ok", flush=True)
+            except Exception as exc:  # noqa: BLE001 - pipe failure means fall back
+                last_error = type(exc).__name__
+                print(f"[timing] stream pipe failed: {last_error}", flush=True)
+                source = None
+                first = b""
+        if source is None:
             print(f"[timing] stream failed: {last_error}", flush=True)
             return self.json_response(502, {"error": "Không truyền trực tiếp được. Hãy dùng “Tải bản đầy đủ”.", "fallback": "full"})
         ttfb = time.monotonic() - started
@@ -510,7 +564,7 @@ class App(BaseHTTPRequestHandler):
             while True:
                 if time.monotonic() - started > STREAM_DEADLINE_SECONDS:
                     break
-                chunk = response.read(STREAM_CHUNK)
+                chunk = source.read(STREAM_CHUNK)
                 if not chunk:
                     break
                 sent += len(chunk)
@@ -521,7 +575,8 @@ class App(BaseHTTPRequestHandler):
             pass
         finally:
             try:
-                response.close()
+                if close_source is not None:
+                    close_source()
             except Exception:
                 pass
         print(f"[timing] stream ttfb={ttfb:.1f}s total={time.monotonic() - started:.1f}s bytes={sent}", flush=True)
