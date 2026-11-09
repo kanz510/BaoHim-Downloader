@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1022">
+  <meta name="description" content="HimTik: công cụ tải video TikTok và Douyin công khai về thiết bị. Tải MP4 và tách MP3, hỗ trợ điện thoại và máy tính.">
+  <title>HimTik • Tải video TikTok trực tuyến</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="m5 12 14 0m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-paste" viewBox="0 0 24 24"><rect x="6" y="5" width="14" height="16" rx="2"/><path d="M9 5V3h6v2m-12 5V7a2 2 0 0 1 2-2"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="m10 13 4-4m-1.4-3H16a5 5 0 0 1 0 10h-3m-1.6 2H8a5 5 0 0 1 0-10h3"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 17v3h16v-3"/></symbol>
+    <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13M9 7l12-2"/><ellipse cx="6.5" cy="18" rx="2.5" ry="2"/><ellipse cx="18.5" cy="16" rx="2.5" ry="2"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3z"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-11V5L12 2 4 5v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 2 2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4L12 2Z"/></symbol>
+    <symbol id="i-phone" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M11 18h2"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4 10-10"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  </svg>
+  <div class="ambient a1"></div><div class="ambient a2"></div><div class="ambient a3"></div>
+  <div class="site">
+    <header class="topbar wrap">
+      <a class="brand" href="/" aria-label="Trang chủ HimTik"><span class="brand-mark"><span>H</span></span><span>Him<span class="brand-accent">Tik</span><small>DOWNLOADER</small></span></a>
+      <nav class="nav-links" aria-label="Điều hướng chính"><a href="#features">Tính năng</a><a href="#how">Cách sử dụng</a><a href="#faq">Hỏi đáp</a></nav>
+      <span class="language"><span class="language-dot"></span> Tiếng Việt</span>
+    </header>
+
+    <main>
+      <section class="hero wrap" aria-labelledby="headline">
+        <div class="hero-badge"><span class="badge-spark">✦</span> Công cụ tải video dành cho mọi thiết bị <span class="badge-glow"></span></div>
+        <h1 id="headline">Lưu video bạn thích.<br><span class="headline-gradient">Đơn giản hơn bao giờ hết.</span></h1>
+        <p class="hero-sub">Dán liên kết TikTok hoặc Douyin, xem trước nội dung và lưu video MP4 hoặc âm thanh MP3. Không cần đăng nhập, không cần cài ứng dụng.</p>
+
+        <div class="download-shell">
+          <div class="glass-topline"><span><span class="online-indicator"></span> Bắt đầu tại đây</span><span class="glass-topline-right">TIKTOK &amp; DOUYIN <span>↗</span></span></div>
+          <form id="link-form" novalidate>
+            <label class="visually-hidden" for="video-url">Dán đường dẫn video</label>
+            <div class="input-wrap">
+              <svg class="icon input-icon"><use href="#i-link"/></svg>
+              <input id="video-url" name="url" type="url" inputmode="url" spellcheck="false" autocomplete="off" placeholder="Dán liên kết video TikTok tại đây..." maxlength="2500" required>
+              <button type="button" id="paste-btn" class="paste-btn"><svg class="icon"><use href="#i-paste"/></svg><span>Dán</span></button>
+            </div>
+            <button id="inspect-btn" type="submit" class="primary-btn"><svg class="icon"><use href="#i-download"/></svg><span>Kiểm tra &amp; tải xuống</span><svg class="icon right-arrow"><use href="#i-arrow"/></svg></button>
+          </form>
+          <div class="form-foot"><span><svg class="icon tick"><use href="#i-check"/></svg> Miễn phí</span><span><svg class="icon tick"><use href="#i-check"/></svg> Không cần tài khoản</span><span><svg class="icon tick"><use href="#i-check"/></svg> Hỗ trợ iPhone</span></div>
+          <p id="message" class="message" role="status" aria-live="polite" hidden></p>
+        </div>
+
+        <section id="result" class="result-card" aria-label="Kết quả tìm video" hidden>
+          <div class="result-header"><span class="result-label"><svg class="icon"><use href="#i-check"/></svg> Đã tìm thấy nội dung</span><button type="button" id="reset-btn" class="reset-btn" aria-label="Đóng kết quả"><svg class="icon"><use href="#i-close"/></svg></button></div>
+          <div class="result-body"><div class="thumbnail"><img id="video-thumb" src="" alt="Ảnh xem trước bài đăng" referrerpolicy="no-referrer" hidden><div id="thumb-placeholder"><svg class="icon"><use href="#i-video"/></svg></div></div><div class="video-meta"><div id="video-origin" class="origin">TikTok</div><h3 id="video-title">Video TikTok</h3><p id="video-creator">@creator</p><span id="video-duration" class="video-duration"></span></div></div>
+          <div class="download-options"><button type="button" id="download-video" class="option-btn video-option"><svg class="icon"><use href="#i-video"/></svg><span><strong>Tải video</strong><small>MP4 · Chất lượng tốt nhất khả dụng</small></span><svg class="icon arrow"><use href="#i-download"/></svg></button><button type="button" id="download-audio" class="option-btn audio-option"><svg class="icon"><use href="#i-music"/></svg><span><strong>Tải âm thanh</strong><small>MP3 · 192 kbps tối đa</small></span><svg class="icon arrow"><use href="#i-download"/></svg></button></div>
+          <div id="job-status" class="job-status" role="status" aria-live="polite" hidden><div class="spinner"></div><span id="job-text">Đang xử lý...</span></div><a id="file-ready" class="file-ready" href="#" download hidden><svg class="icon"><use href="#i-download"/></svg> Chạm đây để lưu tệp vào máy</a>
+          <p class="result-note">Không logo chỉ khi nguồn video hỗ trợ. Hãy chỉ tải nội dung bạn có quyền sử dụng.</p>
+        </section>
+        <div class="hero-caption"><div class="avatar-dots"><span>▶</span><span>♫</span><span>✓</span></div><span>Một nơi cho video, âm thanh và những khoảnh khắc đáng lưu.</span></div>
+      </section>
+
+      <section id="features" class="features wrap" aria-labelledby="features-title"><div class="section-heading"><span class="eyebrow">ĐƯỢC THIẾT KẾ CHO BẠN</span><h2 id="features-title">Mọi thứ bạn cần. <span>Không rườm rà.</span></h2><p>Không cần ứng dụng nặng máy hay những bước tải khó hiểu.</p></div>
+        <div class="feature-grid">
+          <article class="feature"><div class="feature-icon purple"><svg class="icon"><use href="#i-video"/></svg></div><h3>Video MP4</h3><p>Tải video từ bài đăng công khai với chất lượng nguồn khả dụng.</p><span class="feature-tag">VIDEO</span></article>
+          <article class="feature"><div class="feature-icon cyan"><svg class="icon"><use href="#i-music"/></svg></div><h3>Âm thanh MP3</h3><p>Lưu riêng âm thanh để sử dụng ngoại tuyến khi bạn có quyền.</p><span class="feature-tag">AUDIO</span></article>
+          <article class="feature"><div class="feature-icon peach"><svg class="icon"><use href="#i-phone"/></svg></div><h3>Ưu tiên di động</h3><p>Tối ưu thao tác dán link, tải xuống trên Safari và Chrome.</p><span class="feature-tag">MOBILE FIRST</span></article>
+        </div>
+      </section>
+      <section id="how" class="steps wrap" aria-labelledby="steps-title"><div class="section-heading"><span class="eyebrow">CHỈ 3 BƯỚC</span><h2 id="steps-title">Dễ như <span>1, 2, 3.</span></h2></div><div class="steps-grid"><article class="step"><span>01</span><h3>Sao chép liên kết</h3><p>Mở bài đăng TikTok, nhấn Chia sẻ rồi chọn Sao chép liên kết.</p></article><article class="step"><span>02</span><h3>Dán vào HimTik</h3><p>Dán link vào ô phía trên và nhấn Kiểm tra &amp; tải xuống.</p></article><article class="step"><span>03</span><h3>Lưu về thiết bị</h3><p>Chọn video hoặc âm thanh. iPhone thường lưu tệp trong ứng dụng Tệp.</p></article></div></section>
+      <section id="faq" class="faq wrap" aria-labelledby="faq-title"><div class="section-heading"><span class="eyebrow">GIẢI ĐÁP NHANH</span><h2 id="faq-title">Có gì <span>thắc mắc?</span></h2></div><div class="faq-list"><details><summary>Có cần đăng nhập TikTok không?<span>+</span></summary><p>Không. Công cụ dành cho bài đăng công khai; không yêu cầu tài khoản, mật khẩu hay cookie TikTok của bạn.</p></details><details><summary>Có chắc chắn không có watermark không?<span>+</span></summary><p>Không. Kết quả phụ thuộc nguồn video mà nền tảng cung cấp. HimTik không chỉnh sửa và xóa logo được gắn sẵn vào hình ảnh.</p></details><details><summary>File tải về nằm ở đâu trên iPhone?<span>+</span></summary><p>Mở ứng dụng Tệp → Duyệt → Tải về (Downloads), hoặc mục tải xuống của Safari. Từ Tệp, bạn có thể chia sẻ video vào ứng dụng Ảnh.</p></details><details><summary>Có hỗ trợ ảnh slideshow không?<span>+</span></summary><p>Bản đầu tiên ưu tiên video MP4 và âm thanh MP3. Tải slideshow/album ảnh sẽ được bổ sung trong phiên bản tiếp theo.</p></details></div></section>
+    </main>
+    <footer class="footer wrap"><div class="footer-brand"><span class="brand-mark small"><span>H</span></span><strong>HimTik</strong><span class="footer-dot">·</span><span>Made for simple moments</span></div><p>Công cụ độc lập, không liên kết với TikTok/ByteDance. Tôn trọng bản quyền nội dung của người sáng tạo.</p><span>© <span id="year">2026</span> HimTik</span></footer>
+  </div>
+</body>
+</html>
