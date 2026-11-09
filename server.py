@@ -389,7 +389,11 @@ def check_rate(ip: str, weight: int = 1) -> bool:
 
 
 class App(BaseHTTPRequestHandler):
-    server_version = "HimTik/2.0"
+    # Note: no protocol_version override, so this speaks HTTP/1.0 and every
+    # response closes its connection. That is what makes a rejected POST
+    # harmless: unread request bytes can never leak into a following request
+    # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
+    server_version = "HimTik/2.0.1"
     sys_version = ""
 
     def log_message(self, fmt, *args):
@@ -415,6 +419,10 @@ class App(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        # An early POST rejection can leave unread request bytes. HTTP/1.1 must
+        # explicitly close that connection rather than parsing JSON as a method.
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.headers_common()
         self.end_headers()
         self.wfile.write(raw)
@@ -584,19 +592,45 @@ class App(BaseHTTPRequestHandler):
         cleanup_jobs()
         route = urlsplit(self.path).path
         if route not in ("/api/inspect", "/api/download"):
+            # Route rejection happens before the body is read: never reuse
+            # this TCP connection with leftover JSON bytes.
+            self.close_connection = True
             return self.json_response(404, {"error": "Đường dẫn không hợp lệ."})
+        if self.headers.get("Transfer-Encoding"):
+            # This simple server supports bounded Content-Length, not chunked
+            # request bodies. Close to prevent parsing leftover chunks as HTTP.
+            self.close_connection = True
+            return self.json_response(400, {"error": "Không hỗ trợ yêu cầu dạng chunked."})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return self.json_response(400, {"error": "Content-Length không hợp lệ."})
+        if length <= 0 or length > MAX_REQUEST:
+            # Do not read an unbounded body: reject and close the connection.
+            self.close_connection = True
+            return self.json_response(413 if length > MAX_REQUEST else 400,
+                                      {"error": "Dữ liệu yêu cầu quá lớn hoặc bị thiếu."})
+        try:
+            body = self.rfile.read(length)
+        except (OSError, TimeoutError):
+            self.close_connection = True
+            return self.json_response(400, {"error": "Không đọc được dữ liệu yêu cầu."})
+        if len(body) != length:
+            self.close_connection = True
+            return self.json_response(400, {"error": "Dữ liệu yêu cầu không đầy đủ."})
+        # Read the complete bounded request body BEFORE applying rate limits.
+        # Without this, a rejected POST leaves {json} in the socket and a
+        # following GET becomes '{json}GET' (HTTP 501/400).
         ip = self.client_address[0]  # Don't trust X-Forwarded-For from arbitrary clients.
         if not check_rate(ip, 3 if route == "/api/download" else 1):
             return self.json_response(429, {"error": "Thao tác quá nhanh. Vui lòng thử lại sau ít phút."})
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= MAX_REQUEST:
-                raise ValueError("Dữ liệu yêu cầu quá lớn hoặc bị thiếu.")
-            payload = json.loads(self.rfile.read(length))
+            payload = json.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("Dữ liệu yêu cầu không hợp lệ.")
             url = extract_url(payload.get("url", ""))
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        except (ValueError, TypeError) as exc:
             return self.json_response(400, {"error": str(exc) or "Dữ liệu không hợp lệ."})
         if route == "/api/inspect":
             try:

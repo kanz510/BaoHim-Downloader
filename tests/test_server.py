@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import tempfile
@@ -181,6 +182,65 @@ class HttpTests(unittest.TestCase):
         status, body, _ = self.request('/api/inspect', {'url':'https://example.com/file'})
         self.assertEqual(status, 400)
         self.assertIn('error',json.loads(body))
+
+    def test_rate_limited_post_does_not_break_next_request(self):
+        # A rate-limited POST must not corrupt later requests. V2 speaks
+        # HTTP/1.0 (default), so every response closes its connection and
+        # unread body bytes can never leak into a following request.
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        try:
+            body = json.dumps({'url': 'https://www.tiktok.com/@demo/video/123',
+                               'type': 'video'}).encode('utf-8')
+            with patch('server.check_rate', return_value=False):
+                conn.request('POST', '/api/download', body=body,
+                             headers={'Content-Type': 'application/json'})
+                response = conn.getresponse()
+                self.assertEqual(response.status, 429)
+                self.assertEqual(response.getheader('Connection'), 'close')
+                response.read()
+        finally:
+            conn.close()
+        # Fresh connection after the rejected POST must work normally.
+        status, body, _ = self.request('/api/health')
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)['ok'])
+
+    def test_early_post_rejection_closes_connection(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        try:
+            conn.request('POST', '/wrong-route', body=b'{"url":"junk"}',
+                         headers={'Content-Type': 'application/json'})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 404)
+            self.assertEqual(response.getheader('Connection'), 'close')
+            response.read()
+        finally:
+            conn.close()
+
+    def test_oversized_post_closes_connection(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        try:
+            conn.request('POST', '/api/download', body=b'x' * (server.MAX_REQUEST + 1),
+                         headers={'Content-Type': 'application/json'})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 413)
+            self.assertEqual(response.getheader('Connection'), 'close')
+            response.read()
+        finally:
+            conn.close()
+
+    def test_chunked_request_rejected_and_closed(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        try:
+            conn.request('POST', '/api/download', body=[b'{"url":"bad"}'],
+                         headers={'Content-Type': 'application/json'},
+                         encode_chunked=True)
+            response = conn.getresponse()
+            self.assertEqual(response.status, 400)
+            self.assertEqual(response.getheader('Connection'), 'close')
+            response.read()
+        finally:
+            conn.close()
 
     @patch('server.inspect_media')
     def test_api_inspect(self, mock):
