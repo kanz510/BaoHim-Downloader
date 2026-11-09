@@ -41,7 +41,7 @@ Kiểm thử mock chỉ chứng minh định tuyến và kiểm tra dữ liệu;
 
 ## Giới hạn & bảo mật
 
-- Giao diện và API chạy chung domain, tránh lỗi CORS. Đừng host HTML thuần trên GitHub Pages và tưởng là tải được; GitHub Pages không chạy backend.
+- Giao diện và API chạy chung domain, tránh lỗi CORS. API cũng cho phép gọi cross-origin từ https://kanz510.github.io (tab tải video trong app đơn hàng). Đừng host HTML thuần trên GitHub Pages và tưởng là tải được; GitHub Pages không chạy backend.
 - URL nguồn chỉ chấp nhận TikTok/Douyin. `yt-dlp` có thể tự đi theo redirect của nguồn; trước khi mở dịch vụ cho người lạ, cần thêm kiểm soát redirect/SSRF ở tầng mạng, proxy trusted, WAF/rate limit theo IP và theo dõi lưu lượng/CPU/ổ đĩa.
 - Trạng thái jobs đang được lưu trong RAM của **một tiến trình**. Render khởi động lại thì job mất. Để scale nhiều máy, cần Redis/object storage.
 - Máy chủ giới hạn tệp đầu ra 120 MB, nhưng file tạm của bộ giải mã vẫn có thể vượt quá hạn mức trước khi cleanup. Cần giới hạn container disk/CPU khi triển khai lớn.

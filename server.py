@@ -27,6 +27,8 @@ MAX_BYTES = 120 * 1024 * 1024
 MAX_REQUEST = 4096
 JOB_TTL_SECONDS = 20 * 60
 MAX_JOBS = 8
+# Origins allowed to call the API cross-origin (order app tab on GitHub Pages).
+ALLOWED_ORIGINS = ("https://kanz510.github.io",)
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 JOBS = {}
 RATE = {}
@@ -162,7 +164,14 @@ class App(BaseHTTPRequestHandler):
         # Don't log TikTok links or identifying query strings.
         print("[http]", self.command, self.path.split("?")[0], self.address_string(), flush=True)
 
+    def cors_headers(self):
+        origin = self.headers.get("Origin", "")
+        if origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
     def headers_common(self):
+        self.cors_headers()
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
@@ -232,6 +241,14 @@ class App(BaseHTTPRequestHandler):
         self.headers_common()
         self.end_headers()
         self.wfile.write(data)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.cors_headers()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self):
         cleanup_jobs()
