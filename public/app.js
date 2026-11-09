@@ -8,6 +8,7 @@ const pasteButton = document.getElementById('paste-btn');
 const jobStatus = document.getElementById('job-status');
 const jobText = document.getElementById('job-text');
 const fileReady = document.getElementById('file-ready');
+const fullButton = document.getElementById('full-download');
 const videoButton = document.getElementById('download-video');
 const audioButton = document.getElementById('download-audio');
 let activeUrl = '';
@@ -107,6 +108,7 @@ document.getElementById('reset-btn').addEventListener('click', () => {
   result.hidden = true;
   jobStatus.hidden = true;
   fileReady.hidden = true;
+  fullButton.hidden = true;
   if (pollTimer) clearTimeout(pollTimer);
 });
 function setDownloadBusy(value) {
@@ -114,14 +116,17 @@ function setDownloadBusy(value) {
   audioButton.disabled = value;
   jobStatus.hidden = !value;
 }
-async function startDownload(kind) {
+async function startDownload(kind, mode) {
   if (!activeUrl || videoButton.disabled) return;
   setMessage('');
   fileReady.hidden = true;
+  fullButton.hidden = true;
   setDownloadBusy(true);
   jobText.textContent = 'Đang chuẩn bị tải ' + (kind === 'audio' ? 'MP3' : 'video') + '...';
   try {
-    const started = await api('/api/download', {url: activeUrl, type: kind});
+    const payload = {url: activeUrl, type: kind};
+    if (mode === 'full') payload.mode = 'full';
+    const started = await api('/api/download', payload);
     let checks = 0;
     const poll = async () => {
       // Stop after about 3 minutes; the backend has its own 180s timeout.
@@ -129,10 +134,16 @@ async function startDownload(kind) {
       const status = await api('/api/jobs/' + encodeURIComponent(started.job_id));
       if (status.status === 'ready') {
         setDownloadBusy(false);
-        fileReady.href = status.download_url;
+        // V2: stream jobs carry stream_url; file jobs carry download_url.
+        fileReady.href = status.stream_url || status.download_url;
         fileReady.download = 'HimTik-' + kind;
         fileReady.hidden = false;
-        setMessage('Tệp đã sẵn sàng. Chạm nút màu xanh bên dưới để tải, đặc biệt trên iPhone.', 'info');
+        if (status.stream_url) {
+          fullButton.hidden = false;
+          setMessage('Video đã sẵn sàng. Chạm nút xanh để mở video; trên iPhone dùng Chia sẻ → Lưu video. Nếu video không mở được, bấm “Tải bản đầy đủ”.', 'info');
+        } else {
+          setMessage('Tệp đã sẵn sàng. Chạm nút màu xanh bên dưới để tải, đặc biệt trên iPhone.', 'info');
+        }
         return;
       }
       if (status.status === 'error') throw new Error(status.error || 'Không thể tải tệp.');
@@ -146,3 +157,4 @@ async function startDownload(kind) {
 }
 videoButton.addEventListener('click', () => startDownload('video'));
 audioButton.addEventListener('click', () => startDownload('audio'));
+fullButton.addEventListener('click', () => startDownload('video', 'full'));

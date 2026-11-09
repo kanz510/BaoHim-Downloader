@@ -1,19 +1,30 @@
 """HimTik: small standard-library HTTP service that delegates media extraction to yt-dlp.
 
 For TikTok/Douyin public posts only. Doesn't claim guaranteed no-watermark access.
+
+V2: video downloads prefer direct streaming. POST /api/download first resolves the
+post's direct MP4 URL (cached metadata) and returns a ready stream job; the client
+then fetches GET /api/stream/<job> and the server pipes the CDN bytes straight
+through without saving the file on Render. When no direct MP4 is available, or
+streaming fails, the client falls back to the original full-download job
+(GET /api/files/<job>). Audio (MP3) always uses the full-download path.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +38,14 @@ MAX_BYTES = 120 * 1024 * 1024
 MAX_REQUEST = 4096
 JOB_TTL_SECONDS = 20 * 60
 MAX_JOBS = 8
+# Direct-URL metadata cache: one yt-dlp extraction per link per 10 minutes.
+META_CACHE_TTL_SECONDS = 10 * 60
+META_CACHE_MAX = 50
+# Wall-clock budget for one proxied stream (extraction already happened before).
+STREAM_DEADLINE_SECONDS = 240
+STREAM_READ_TIMEOUT = 15
+STREAM_CHUNK = 256 * 1024
+META_CACHE = {}
 # Origins allowed to call the API cross-origin (order app tab on GitHub Pages).
 ALLOWED_ORIGINS = ("https://kanz510.github.io",)
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
@@ -66,11 +85,25 @@ def ytdlp_base() -> list[str]:
     ]
 
 
-def inspect_media(url: str) -> dict:
+def inspect_media(url: str, force: bool = False) -> dict:
+    """Run yt-dlp --dump-single-json once per link (cached 10 minutes).
+
+    Returns the full parsed info (display fields + formats + http_headers) so
+    callers can pick a direct MP4 URL without a second extraction run.
+    """
+    now = time.time()
+    if not force:
+        with LOCK:
+            hit = META_CACHE.get(url)
+            if hit and now - hit["created"] < META_CACHE_TTL_SECONDS:
+                print("[timing] inspect cache-hit", flush=True)
+                return hit["info"]
+    started = time.monotonic()
     result = subprocess.run(
-        ytdlp_base() + ["--dump-single-json", "--skip-download", url],
+        ytdlp_base() + ["--dump-single-json", "--skip-download", "--no-check-formats", url],
         capture_output=True, text=True, timeout=40, check=False,
     )
+    print(f"[timing] inspect {'forced' if force else 'miss'} {time.monotonic() - started:.1f}s rc={result.returncode}", flush=True)
     if result.returncode != 0:
         raise ValueError("Không đọc được bài đăng. Hãy thử video công khai khác hoặc kiểm tra liên kết.")
     try:
@@ -81,13 +114,115 @@ def inspect_media(url: str) -> dict:
         raise ValueError("Bài đăng dạng album/playlist chưa hỗ trợ trong phiên bản này.")
     if not info.get("formats") and not info.get("url"):
         raise ValueError("Không tìm thấy luồng video có thể tải cho bài đăng này.")
-    return {
+    parsed = {
         "title": str(info.get("title") or info.get("description") or "Video TikTok")[:150],
         "creator": str(info.get("uploader") or info.get("creator") or "TikTok")[:80],
         "thumbnail": str(info.get("thumbnail") or "")[:1500],
         "duration": info.get("duration") if isinstance(info.get("duration"), (int, float)) else None,
         "source": "Douyin" if "douyin" in (info.get("extractor_key") or "").lower() else "TikTok",
+        "formats": info.get("formats") or [],
+        "http_headers": info.get("http_headers") or {},
     }
+    with LOCK:
+        META_CACHE[url] = {"created": now, "info": parsed}
+        while len(META_CACHE) > META_CACHE_MAX:
+            META_CACHE.pop(next(iter(META_CACHE)), None)
+    return parsed
+
+
+def public_info(info: dict) -> dict:
+    """Display fields for /api/inspect (no direct media URLs)."""
+    return {k: info.get(k) for k in ("title", "creator", "thumbnail", "duration", "source")}
+
+
+def pick_direct(info: dict) -> dict | None:
+    """Best progressive MP4 (video+audio) direct URL from yt-dlp metadata.
+
+    Prefers TikTok's own 'download' format, then the highest h264+aac MP4,
+    then any MP4 with both tracks. Returns None when only split/HLS formats
+    exist (caller falls back to the full-download job).
+    """
+    candidates = []
+    for fmt in info.get("formats") or []:
+        if not isinstance(fmt, dict):
+            continue
+        media_url = fmt.get("url") or ""
+        if (
+            fmt.get("ext") != "mp4"
+            or not media_url.startswith("https://")
+            or fmt.get("protocol") not in (None, "https")
+            or fmt.get("vcodec") in (None, "none")
+            or fmt.get("acodec") in (None, "none")
+        ):
+            continue
+        size = fmt.get("filesize") or fmt.get("filesize_approx")
+        candidates.append({
+            "url": media_url,
+            "format_id": str(fmt.get("format_id") or ""),
+            "vcodec": str(fmt.get("vcodec") or ""),
+            "filesize": size if isinstance(size, int) and size > 0 else None,
+            "height": fmt.get("height") if isinstance(fmt.get("height"), int) else 0,
+            "http_headers": fmt.get("http_headers") or info.get("http_headers") or {},
+        })
+    if not candidates:
+        return None
+    for cand in candidates:
+        if cand["format_id"] == "download":
+            return cand
+    h264 = [c for c in candidates if c["vcodec"].lower().startswith("h264")
+            or c["vcodec"].lower().startswith("avc")]
+    pool = h264 or candidates
+    # Highest resolution first; unknown height sorts last.
+    return max(pool, key=lambda c: (c["height"], c["filesize"] or 0))
+
+
+def validate_stream_url(url: str) -> bool:
+    """SSRF guard for a yt-dlp-provided media URL: public https host only.
+
+    Rejects credentials, non-standard ports, and any hostname that resolves
+    to a private/loopback/link-local/multicast/reserved address.
+    """
+    try:
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.username or parts.password:
+            return False
+        if parts.port not in (None, 443) or not parts.hostname:
+            return False
+        infos = socket.getaddrinfo(parts.hostname, 443, proto=socket.IPPROTO_TCP)
+        if not infos:
+            return False
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+                return False
+    except (ValueError, socket.gaierror, OSError):
+        return False
+    return True
+
+
+def is_mp4_prefix(data: bytes) -> bool:
+    return len(data) >= 8 and data[4:8] == b"ftyp"
+
+
+class _ValidatedRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to URLs that pass the same SSRF checks."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not validate_stream_url(newurl):
+            raise urllib.error.URLError("redirect target failed validation")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_direct(url: str, headers: dict):
+    """Open a validated direct media URL with yt-dlp's headers."""
+    if not validate_stream_url(url):
+        raise urllib.error.URLError("direct URL failed validation")
+    safe = {k: str(v) for k, v in (headers or {}).items()
+            if k.lower() not in ("host", "content-length", "connection")}
+    opener = urllib.request.build_opener(_ValidatedRedirect)
+    req = urllib.request.Request(url, headers=safe)
+    return opener.open(req, timeout=STREAM_READ_TIMEOUT)
 
 
 def download_media(job_id: str, url: str, file_type: str) -> None:
@@ -115,6 +250,15 @@ def download_media(job_id: str, url: str, file_type: str) -> None:
         size = selected.stat().st_size
         if not 0 < size <= MAX_BYTES:
             raise ValueError("Tệp quá lớn; giới hạn hiện tại là 120 MB.")
+        # Format check: the downloaded bytes must match the requested container.
+        with selected.open("rb") as probe:
+            head = probe.read(12)
+        if file_type == "audio":
+            ok = head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0)
+        else:
+            ok = is_mp4_prefix(head) or head[:4] in (b"\x1a\x45\xdf\xa3",)  # mp4 or mkv/webm
+        if not ok:
+            raise ValueError("Tệp tải về không đúng định dạng.")
         with LOCK:
             JOBS[job_id].update(status="ready", filename=str(selected), bytes=size)
     except (ValueError, subprocess.TimeoutExpired, OSError) as exc:
@@ -157,7 +301,7 @@ def check_rate(ip: str, weight: int = 1) -> bool:
 
 
 class App(BaseHTTPRequestHandler):
-    server_version = "HimTik/1.0"
+    server_version = "HimTik/2.0"
     sys_version = ""
 
     def log_message(self, fmt, *args):
@@ -197,11 +341,19 @@ class App(BaseHTTPRequestHandler):
             with LOCK:
                 job = JOBS.get(jid)
                 payload = {k: job[k] for k in ("status", "error", "bytes") if k in job} if job else None
+                mode = job.get("mode") if job else None
             if payload is None:
                 return self.json_response(404, {"error": "Phiên tải không tồn tại hoặc đã hết hạn."})
             if payload["status"] == "ready":
-                payload["download_url"] = "/api/files/" + jid
+                if mode == "stream":
+                    payload["mode"] = "stream"
+                    payload["stream_url"] = "/api/stream/" + jid
+                else:
+                    payload["download_url"] = "/api/files/" + jid
             return self.json_response(200, payload)
+        if route.startswith("/api/stream/"):
+            jid = route.rsplit("/", 1)[-1]
+            return self.handle_stream(jid)
         if route.startswith("/api/files/"):
             jid = route.rsplit("/", 1)[-1]
             with LOCK:
@@ -242,6 +394,95 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def handle_stream(self, jid):
+        """Pipe a stream job's direct MP4 URL to the client without saving it.
+
+        Validates the first bytes (MP4 magic) before sending headers, so a bad
+        source still returns a JSON error. On a CDN failure the direct URL is
+        refreshed once via inspect; if that also fails the client is told to
+        use the full-download fallback.
+        """
+        with LOCK:
+            job = JOBS.get(jid)
+            if not job or job.get("mode") != "stream":
+                return self.json_response(404, {"error": "Phiên truyền trực tiếp không tồn tại hoặc đã hết hạn."})
+            direct = dict(job.get("direct") or {})
+            source_url = job.get("source_url") or ""
+        started = time.monotonic()
+        response = None
+        first = b""
+        content_length = None
+        attempts = 0
+        while attempts < 2:
+            attempts += 1
+            try:
+                if attempts > 1:
+                    info = inspect_media(source_url, force=True)
+                    fresh = pick_direct(info)
+                    if not fresh:
+                        raise urllib.error.URLError("no direct URL on refresh")
+                    direct = fresh
+                    with LOCK:
+                        if jid in JOBS:
+                            JOBS[jid]["direct"] = fresh
+                response = open_direct(direct["url"], direct.get("http_headers") or {})
+                declared = response.headers.get("Content-Length")
+                if declared is not None:
+                    try:
+                        content_length = int(declared)
+                    except ValueError:
+                        content_length = None
+                    if content_length is not None and not 0 < content_length <= MAX_BYTES:
+                        raise ValueError("Tệp quá lớn; giới hạn hiện tại là 120 MB.")
+                first = response.read(32 * 1024)
+                if not first:
+                    raise ValueError("Nguồn video không trả dữ liệu.")
+                if not is_mp4_prefix(first):
+                    raise ValueError("Nguồn video không đúng định dạng MP4.")
+                break
+            except Exception as exc:  # noqa: BLE001 - any fetch failure retries once, then 502
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    response = None
+                if attempts >= 2:
+                    print(f"[timing] stream failed after refresh: {type(exc).__name__}", flush=True)
+                    return self.json_response(502, {"error": "Không truyền trực tiếp được. Hãy dùng “Tải bản đầy đủ”.", "fallback": "full"})
+                print(f"[timing] stream retry after {type(exc).__name__}", flush=True)
+        ttfb = time.monotonic() - started
+        name = "HimTik-" + jid[:8] + ".mp4"
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        if content_length is not None:
+            self.send_header("Content-Length", str(content_length))
+        self.send_header("Content-Disposition", f'inline; filename="{name}"')
+        self.headers_common()
+        self.end_headers()
+        sent = 0
+        try:
+            self.wfile.write(first)
+            sent += len(first)
+            while True:
+                if time.monotonic() - started > STREAM_DEADLINE_SECONDS:
+                    break
+                chunk = response.read(STREAM_CHUNK)
+                if not chunk:
+                    break
+                sent += len(chunk)
+                if sent > MAX_BYTES:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+        print(f"[timing] stream ttfb={ttfb:.1f}s total={time.monotonic() - started:.1f}s bytes={sent}", flush=True)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.cors_headers()
@@ -270,20 +511,43 @@ class App(BaseHTTPRequestHandler):
             return self.json_response(400, {"error": str(exc) or "Dữ liệu không hợp lệ."})
         if route == "/api/inspect":
             try:
-                return self.json_response(200, inspect_media(url))
+                return self.json_response(200, public_info(inspect_media(url)))
             except subprocess.TimeoutExpired:
                 return self.json_response(504, {"error": "Nguồn phản hồi quá chậm. Vui lòng thử lại."})
-            except (ValueError, OSError) as exc:
+            except ValueError as exc:
                 return self.json_response(422, {"error": str(exc)})
+            except OSError:
+                return self.json_response(422, {"error": "Máy chủ chưa cài yt-dlp hoặc FFmpeg."})
         file_type = payload.get("type", "video")
         if file_type not in ("video", "audio"):
             return self.json_response(400, {"error": "Định dạng không hỗ trợ."})
+        mode = payload.get("mode", "stream")
+        if file_type == "video" and mode != "full":
+            # Fast path: resolve the direct MP4 once (cached) and hand the
+            # client a ready stream job. No file is downloaded to Render.
+            try:
+                direct = pick_direct(inspect_media(url))
+            except subprocess.TimeoutExpired:
+                return self.json_response(504, {"error": "Nguồn phản hồi quá chậm. Vui lòng thử lại."})
+            except ValueError as exc:
+                return self.json_response(422, {"error": str(exc)})
+            except OSError:
+                return self.json_response(422, {"error": "Máy chủ chưa cài yt-dlp hoặc FFmpeg."})
+            if direct:
+                jid = secrets.token_urlsafe(24)
+                with LOCK:
+                    JOBS[jid] = {"created": time.time(), "status": "ready", "error": "",
+                                 "bytes": direct["filesize"] or 0, "mode": "stream",
+                                 "direct": direct, "source_url": url}
+                print(f"[timing] download stream-ready format={direct['format_id']} bytes={direct['filesize']}", flush=True)
+                return self.json_response(202, {"job_id": jid, "status": "ready",
+                                                "mode": "stream", "stream_url": "/api/stream/" + jid})
         with LOCK:
             in_progress = sum(1 for j in JOBS.values() if j["status"] in ("queued", "processing"))
             if in_progress >= MAX_JOBS:
                 return self.json_response(503, {"error": "Máy chủ đang bận. Hãy thử lại trong ít phút."})
             jid = secrets.token_urlsafe(24)
-            JOBS[jid] = {"created": time.time(), "status": "queued", "error": "", "bytes": 0}
+            JOBS[jid] = {"created": time.time(), "status": "queued", "error": "", "bytes": 0, "mode": "file"}
         POOL.submit(download_media, jid, url, file_type)
         return self.json_response(202, {"job_id": jid, "status": "queued"})
 
