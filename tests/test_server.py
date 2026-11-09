@@ -226,10 +226,10 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(json.loads(body)['status'], 'queued')
         submit.assert_called_once()
 
-    def _stream_job(self):
+    def _stream_job(self, age_seconds=0):
         jid = 'streamjob123'
         with server.LOCK:
-            server.JOBS[jid] = {'created': time.time(), 'status': 'ready', 'error': '',
+            server.JOBS[jid] = {'created': time.time() - age_seconds, 'status': 'ready', 'error': '',
                                 'bytes': 0, 'mode': 'stream',
                                 'direct': {'url': 'https://v16-webapp-prime.us.tiktok.com/h264.mp4',
                                            'format_id': 'h264_540p_136145-0', 'filesize': 100,
@@ -251,10 +251,12 @@ class HttpTests(unittest.TestCase):
 
     @patch('server.inspect_media')
     @patch('server.open_direct')
-    def test_stream_rejects_non_mp4(self, mock_open, mock_inspect):
+    @patch('server.open_ytdlp_pipe')
+    def test_stream_rejects_non_mp4(self, mock_pipe, mock_open, mock_inspect):
         jid = self._stream_job()
         mock_open.return_value = FakeStreamResponse([b'<html>not a video</html>'])
         mock_inspect.return_value = {'formats': []}  # refresh finds no direct URL
+        mock_pipe.side_effect = RuntimeError('yt-dlp unavailable')
         status, body, _ = self.request('/api/stream/' + jid)
         self.assertEqual(status, 502)
         self.assertEqual(json.loads(body)['fallback'], 'full')
@@ -263,15 +265,29 @@ class HttpTests(unittest.TestCase):
     @patch('server.open_direct')
     @patch('server.open_ytdlp_pipe')
     def test_stream_refresh_then_fallback(self, mock_pipe, mock_open, mock_inspect):
+        # Fresh job: the refresh is skipped (a 403 means blocked, not expired).
         jid = self._stream_job()
+        mock_open.side_effect = URLError('blocked')
+        mock_pipe.side_effect = RuntimeError('yt-dlp unavailable')
+        status, body, _ = self.request('/api/stream/' + jid)
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body)['fallback'], 'full')
+        self.assertEqual(mock_open.call_count, 1)
+        mock_inspect.assert_not_called()
+        mock_pipe.assert_called_once()
+
+    @patch('server.inspect_media')
+    @patch('server.open_direct')
+    @patch('server.open_ytdlp_pipe')
+    def test_stream_refreshes_stale_job(self, mock_pipe, mock_open, mock_inspect):
+        # Job older than the metadata cache: the refresh runs before the pipe.
+        jid = self._stream_job(age_seconds=601)
         mock_open.side_effect = URLError('blocked')
         mock_inspect.return_value = {'formats': []}  # refresh finds no direct URL
         mock_pipe.side_effect = RuntimeError('yt-dlp unavailable')
         status, body, _ = self.request('/api/stream/' + jid)
         self.assertEqual(status, 502)
         self.assertEqual(json.loads(body)['fallback'], 'full')
-        # The single-candidate job tries its URL, then the refresh finds nothing, then the pipe fails.
-        self.assertEqual(mock_open.call_count, 1)
         mock_inspect.assert_called_once()
         mock_pipe.assert_called_once()
 

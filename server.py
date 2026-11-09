@@ -450,6 +450,7 @@ class App(BaseHTTPRequestHandler):
                 return self.json_response(404, {"error": "Phiên truyền trực tiếp không tồn tại hoặc đã hết hạn."})
             candidates = list(job.get("direct_list") or ([job["direct"]] if job.get("direct") else []))
             source_url = job.get("source_url") or ""
+            job_created = job.get("created") or time.time()
         started = time.monotonic()
         source = None          # object with .read(n)
         close_source = None    # callable to release it
@@ -516,8 +517,10 @@ class App(BaseHTTPRequestHandler):
                 source = None
                 content_length = None
                 first = b""
-        if source is None:
-            # One refresh: the cached links may have expired.
+        if source is None and time.time() - job_created > META_CACHE_TTL_SECONDS:
+            # Only refresh when the job is older than the metadata cache: on
+            # a fresh job a 403 means the CDN refuses this client, not that
+            # the links expired, so a re-extract would return the same URLs.
             try:
                 fresh_list = pick_direct_list(inspect_media(source_url, force=True))
                 if fresh_list:
