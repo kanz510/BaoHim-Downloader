@@ -94,7 +94,14 @@ class UrlTests(unittest.TestCase):
         picked = server.pick_direct(info)
         self.assertEqual(picked['format_id'], 'bytevc1_720p_118748-0')
 
-    def test_pick_direct_returns_none_without_progressive_mp4(self):
+    def test_pick_direct_list_orders_candidates(self):
+        info = fake_info()
+        ordered = server.pick_direct_list(info)
+        self.assertEqual([c["format_id"] for c in ordered],
+                         ["download", "h264_540p_136145-0", "bytevc1_720p_118748-0"])
+        # The HLS format and the audio-only format are excluded.
+        self.assertTrue(all(c["url"].startswith("https://") for c in ordered))
+        self.assertEqual(len({c["url"] for c in ordered}), len(ordered))
         info = fake_info()
         info['formats'] = [f for f in info['formats'] if f['format_id'] in ('audio', 'hls')]
         self.assertIsNone(server.pick_direct(info))
@@ -261,8 +268,27 @@ class HttpTests(unittest.TestCase):
         status, body, _ = self.request('/api/stream/' + jid)
         self.assertEqual(status, 502)
         self.assertEqual(json.loads(body)['fallback'], 'full')
+        # The single-candidate job tries its URL, then the refresh finds nothing.
         self.assertEqual(mock_open.call_count, 1)
         mock_inspect.assert_called_once()
+
+    @patch('server.open_direct')
+    def test_stream_tries_next_candidate(self, mock_open):
+        jid = self._stream_job()
+        with server.LOCK:
+            server.JOBS[jid]["direct_list"] = [
+                {"url": "https://v16-webapp-prime.us.tiktok.com/blocked.mp4",
+                 "format_id": "download", "filesize": None, "http_headers": {}},
+                {"url": "https://v19-webapp-prime.us.tiktok.com/h264.mp4",
+                 "format_id": "h264_540p_136145-1", "filesize": 100, "http_headers": {}},
+            ]
+        payload = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00' + b'0123456789' * 8
+        mock_open.side_effect = [URLError('blocked'),
+                                 FakeStreamResponse([payload], content_length=len(payload))]
+        status, body, headers = self.request('/api/stream/' + jid)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, payload)
+        self.assertEqual(mock_open.call_count, 2)
 
     def test_stream_unknown_job(self):
         status, body, _ = self.request('/api/stream/nope')

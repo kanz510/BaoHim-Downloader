@@ -135,12 +135,13 @@ def public_info(info: dict) -> dict:
     return {k: info.get(k) for k in ("title", "creator", "thumbnail", "duration", "source")}
 
 
-def pick_direct(info: dict) -> dict | None:
-    """Best progressive MP4 (video+audio) direct URL from yt-dlp metadata.
+def pick_direct_list(info: dict) -> list[dict]:
+    """Ordered progressive MP4 (video+audio) direct URLs from yt-dlp metadata.
 
     Prefers TikTok's own 'download' format, then the highest h264+aac MP4,
-    then any MP4 with both tracks. Returns None when only split/HLS formats
-    exist (caller falls back to the full-download job).
+    then any MP4 with both tracks. Several candidates are returned because
+    TikTok serves the same video from multiple CDN hosts and one host can
+    refuse a given client while another serves it.
     """
     candidates = []
     for fmt in info.get("formats") or []:
@@ -165,15 +166,27 @@ def pick_direct(info: dict) -> dict | None:
             "http_headers": fmt.get("http_headers") or info.get("http_headers") or {},
         })
     if not candidates:
-        return None
-    for cand in candidates:
-        if cand["format_id"] == "download":
-            return cand
+        return []
+    download = [c for c in candidates if c["format_id"] == "download"]
     h264 = [c for c in candidates if c["vcodec"].lower().startswith("h264")
             or c["vcodec"].lower().startswith("avc")]
-    pool = h264 or candidates
-    # Highest resolution first; unknown height sorts last.
-    return max(pool, key=lambda c: (c["height"], c["filesize"] or 0))
+    rest = [c for c in candidates if c not in download and c not in h264]
+    ordered = download + sorted(h264, key=lambda c: (c["height"], c["filesize"] or 0), reverse=True) \
+        + sorted(rest, key=lambda c: (c["height"], c["filesize"] or 0), reverse=True)
+    # De-duplicate identical URLs while keeping order.
+    seen = set()
+    out = []
+    for cand in ordered:
+        if cand["url"] not in seen:
+            seen.add(cand["url"])
+            out.append(cand)
+    return out
+
+
+def pick_direct(info: dict) -> dict | None:
+    """First candidate of pick_direct_list, or None when no progressive MP4 exists."""
+    found = pick_direct_list(info)
+    return found[0] if found else None
 
 
 def validate_stream_url(url: str) -> bool:
@@ -397,34 +410,29 @@ class App(BaseHTTPRequestHandler):
     def handle_stream(self, jid):
         """Pipe a stream job's direct MP4 URL to the client without saving it.
 
-        Validates the first bytes (MP4 magic) before sending headers, so a bad
-        source still returns a JSON error. On a CDN failure the direct URL is
-        refreshed once via inspect; if that also fails the client is told to
-        use the full-download fallback.
+        Tries the cached direct URLs in order (TikTok serves the same video
+        from several CDN hosts and one host can refuse a client while another
+        serves it). Validates the first bytes (MP4 magic) before sending
+        headers, so a bad source still returns a JSON error. If every cached
+        URL fails, the metadata is refreshed once and the first fresh URL is
+        tried; if that also fails the client is told to use the full-download
+        fallback.
         """
         with LOCK:
             job = JOBS.get(jid)
             if not job or job.get("mode") != "stream":
                 return self.json_response(404, {"error": "Phiên truyền trực tiếp không tồn tại hoặc đã hết hạn."})
-            direct = dict(job.get("direct") or {})
+            candidates = list(job.get("direct_list") or ([job["direct"]] if job.get("direct") else []))
             source_url = job.get("source_url") or ""
         started = time.monotonic()
         response = None
         first = b""
         content_length = None
-        attempts = 0
-        while attempts < 2:
-            attempts += 1
+        tried = 0
+        last_error = ""
+        for direct in candidates[:3]:
+            tried += 1
             try:
-                if attempts > 1:
-                    info = inspect_media(source_url, force=True)
-                    fresh = pick_direct(info)
-                    if not fresh:
-                        raise urllib.error.URLError("no direct URL on refresh")
-                    direct = fresh
-                    with LOCK:
-                        if jid in JOBS:
-                            JOBS[jid]["direct"] = fresh
                 response = open_direct(direct["url"], direct.get("http_headers") or {})
                 declared = response.headers.get("Content-Length")
                 if declared is not None:
@@ -439,18 +447,53 @@ class App(BaseHTTPRequestHandler):
                     raise ValueError("Nguồn video không trả dữ liệu.")
                 if not is_mp4_prefix(first):
                     raise ValueError("Nguồn video không đúng định dạng MP4.")
+                print(f"[timing] stream candidate {tried} ok format={direct.get('format_id')}", flush=True)
                 break
-            except Exception as exc:  # noqa: BLE001 - any fetch failure retries once, then 502
+            except Exception as exc:  # noqa: BLE001 - a failed candidate just means try the next
+                last_error = type(exc).__name__
+                print(f"[timing] stream candidate {tried} failed: {last_error}", flush=True)
                 if response is not None:
                     try:
                         response.close()
                     except Exception:
                         pass
                     response = None
-                if attempts >= 2:
-                    print(f"[timing] stream failed after refresh: {type(exc).__name__}", flush=True)
-                    return self.json_response(502, {"error": "Không truyền trực tiếp được. Hãy dùng “Tải bản đầy đủ”.", "fallback": "full"})
-                print(f"[timing] stream retry after {type(exc).__name__}", flush=True)
+                content_length = None
+                first = b""
+        if response is None:
+            # One refresh: the cached links may have expired.
+            try:
+                fresh_list = pick_direct_list(inspect_media(source_url, force=True))
+                if fresh_list:
+                    direct = fresh_list[0]
+                    with LOCK:
+                        if jid in JOBS:
+                            JOBS[jid]["direct"] = direct
+                            JOBS[jid]["direct_list"] = fresh_list
+                    response = open_direct(direct["url"], direct.get("http_headers") or {})
+                    declared = response.headers.get("Content-Length")
+                    if declared is not None:
+                        try:
+                            content_length = int(declared)
+                        except ValueError:
+                            content_length = None
+                        if content_length is not None and not 0 < content_length <= MAX_BYTES:
+                            raise ValueError("Tệp quá lớn; giới hạn hiện tại là 120 MB.")
+                    first = response.read(32 * 1024)
+                    if not first or not is_mp4_prefix(first):
+                        raise ValueError("Nguồn video không đúng định dạng MP4.")
+                    print("[timing] stream refreshed candidate ok", flush=True)
+            except Exception as exc:  # noqa: BLE001 - refresh failure means fall back
+                last_error = type(exc).__name__
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    response = None
+        if response is None:
+            print(f"[timing] stream failed: {last_error}", flush=True)
+            return self.json_response(502, {"error": "Không truyền trực tiếp được. Hãy dùng “Tải bản đầy đủ”.", "fallback": "full"})
         ttfb = time.monotonic() - started
         name = "HimTik-" + jid[:8] + ".mp4"
         self.send_response(200)
@@ -526,7 +569,9 @@ class App(BaseHTTPRequestHandler):
             # Fast path: resolve the direct MP4 once (cached) and hand the
             # client a ready stream job. No file is downloaded to Render.
             try:
-                direct = pick_direct(inspect_media(url))
+                info = inspect_media(url)
+                direct_list = pick_direct_list(info)
+                direct = direct_list[0] if direct_list else None
             except subprocess.TimeoutExpired:
                 return self.json_response(504, {"error": "Nguồn phản hồi quá chậm. Vui lòng thử lại."})
             except ValueError as exc:
@@ -538,8 +583,9 @@ class App(BaseHTTPRequestHandler):
                 with LOCK:
                     JOBS[jid] = {"created": time.time(), "status": "ready", "error": "",
                                  "bytes": direct["filesize"] or 0, "mode": "stream",
-                                 "direct": direct, "source_url": url}
-                print(f"[timing] download stream-ready format={direct['format_id']} bytes={direct['filesize']}", flush=True)
+                                 "direct": direct, "direct_list": direct_list,
+                                 "source_url": url}
+                print(f"[timing] download stream-ready format={direct['format_id']} bytes={direct['filesize']} candidates={len(direct_list)}", flush=True)
                 return self.json_response(202, {"job_id": jid, "status": "ready",
                                                 "mode": "stream", "stream_url": "/api/stream/" + jid})
         with LOCK:
