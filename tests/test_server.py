@@ -152,6 +152,212 @@ class UrlTests(unittest.TestCase):
         self.assertNotIn('--load-info-json', cmd)
 
 
+class ImageTests(unittest.TestCase):
+    def setUp(self):
+        with server.LOCK:
+            server.META_CACHE.clear()
+            server.JOBS.clear()
+
+    def test_ytdlp_base_default_has_no_playlist(self):
+        self.assertIn("--no-playlist", server.ytdlp_base())
+
+    def test_ytdlp_base_playlist_mode_drops_flag(self):
+        self.assertNotIn("--no-playlist", server.ytdlp_base(playlist=True))
+        self.assertIn("--no-warnings", server.ytdlp_base(playlist=True))
+
+    @patch('server.subprocess.run')
+    def test_inspect_playlist_allowed_in_image_mode(self, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({
+            '_type': 'playlist', 'title': 'Album', 'uploader': 'abc',
+            'entries': [{'id': '1'}, {'id': '2'}, {'id': '3'}],
+            'extractor_key': 'TikTok'})
+        url = 'https://www.tiktok.com/@abc/photo/123'
+        data = server.inspect_media(url, allow_playlist=True)
+        self.assertEqual(data['images'], 3)
+        self.assertNotIn(url, server.META_CACHE)
+        # The same playlist is still rejected in video mode (no cache leak).
+        with self.assertRaises(ValueError):
+            server.inspect_media(url)
+        self.assertEqual(run.call_count, 2)
+        # Image mode dropped --no-playlist; video mode kept it.
+        self.assertNotIn("--no-playlist", run.call_args_list[0][0][0])
+        self.assertIn("--no-playlist", run.call_args_list[1][0][0])
+
+    @patch('server.subprocess.run')
+    def test_inspect_single_image_has_images_1_and_formats(self, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({
+            'title': 'Anh', 'uploader': 'abc', 'duration': None,
+            'formats': [{'format_id': 'img', 'ext': 'jpg', 'vcodec': 'none'}],
+            'extractor_key': 'Instagram'})
+        data = server.inspect_media('https://www.instagram.com/p/AbCd/', allow_playlist=True)
+        self.assertEqual(data['images'], 1)
+        self.assertEqual(data['formats'][0]['vcodec'], 'none')
+        self.assertEqual(data['source'], 'Instagram')
+
+    def test_public_info_images_only_when_present(self):
+        self.assertNotIn('images', server.public_info({'title': 'V', 'source': 'TikTok'}))
+        self.assertEqual(server.public_info({'title': 'A', 'source': 'TikTok', 'images': 3})['images'], 3)
+
+    def test_is_image_bytes(self):
+        self.assertTrue(server.is_image_bytes(b'\xff\xd8\xff' + b'x' * 9, '.jpg'))
+        self.assertTrue(server.is_image_bytes(b'\x89PNG\r\n\x1a\n' + b'x' * 4, '.png'))
+        self.assertTrue(server.is_image_bytes(b'RIFFxxxxWEBP', '.webp'))
+        self.assertTrue(server.is_image_bytes(b'GIF89a' + b'x' * 6, '.gif'))
+        self.assertTrue(server.is_image_bytes(b'BM' + b'x' * 10, '.bmp'))
+        self.assertTrue(server.is_image_bytes(b'\x00\x00\x00\x18ftypavif', '.avif'))
+        self.assertFalse(server.is_image_bytes(b'not an image at all', '.jpg'))
+        self.assertFalse(server.is_image_bytes(b'\xff\xd8\xff' + b'x' * 9, '.png'))
+
+    def test_image_sort_key_na_counts_as_zero(self):
+        self.assertEqual(server._image_sort_key(Path('NA_abc.jpg')), (0, 'NA_abc.jpg'))
+        self.assertEqual(server._image_sort_key(Path('02_abc.jpg')), (2, '02_abc.jpg'))
+        self.assertEqual(server._image_sort_key(Path('01_abc.jpg')), (1, '01_abc.jpg'))
+
+    @patch('server.subprocess.run')
+    def test_download_media_video_command_unchanged(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jid = 'cmdjob'
+                url = 'https://www.tiktok.com/@abc/video/123'
+                with server.LOCK:
+                    server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+                def simulate(command, **kwargs):
+                    Path(tmp, jid, 'test.mp4').write_bytes(b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00video')
+                    return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+                run.side_effect = simulate
+                server.download_media(jid, url, 'video')
+                bin_name = os.environ.get("YTDLP_BIN", "yt-dlp")
+                expected = [bin_name, "--no-playlist", "--no-warnings", "--no-progress",
+                            "--socket-timeout", "12", "--retries", "1", "--fragment-retries", "1",
+                            "--restrict-filenames", "--max-filesize", "120M",
+                            "--output", str(Path(tmp, jid) / "%(id).80s.%(ext)s"),
+                            "-f", "best[ext=mp4]/best", "--merge-output-format", "mp4", url]
+                self.assertEqual(run.call_args[0][0], expected)
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_download_media_audio_command_unchanged(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jid = 'cmdjob'
+                url = 'https://www.tiktok.com/@abc/video/123'
+                with server.LOCK:
+                    server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+                def simulate(command, **kwargs):
+                    Path(tmp, jid, 'test.mp3').write_bytes(b'ID3' + b'\x00' * 20)
+                    return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+                run.side_effect = simulate
+                server.download_media(jid, url, 'audio')
+                bin_name = os.environ.get("YTDLP_BIN", "yt-dlp")
+                expected = [bin_name, "--no-playlist", "--no-warnings", "--no-progress",
+                            "--socket-timeout", "12", "--retries", "1", "--fragment-retries", "1",
+                            "--restrict-filenames", "--max-filesize", "120M",
+                            "--output", str(Path(tmp, jid) / "%(id).80s.%(ext)s"),
+                            "-f", "bestaudio/best", "-x", "--audio-format", "mp3",
+                            "--audio-quality", "192K", url]
+                self.assertEqual(run.call_args[0][0], expected)
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_worker_creates_image_files(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jid = 'imgjob'
+                with server.LOCK:
+                    server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+                def simulate(command, **kwargs):
+                    folder = Path(tmp, jid)
+                    (folder / '02_aaa.jpg').write_bytes(b'\xff\xd8\xff' + b'jpg2')
+                    (folder / '01_bbb.jpg').write_bytes(b'\xff\xd8\xff' + b'jpg1')
+                    return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+                run.side_effect = simulate
+                server.download_media(jid, 'https://www.tiktok.com/@abc/photo/123', 'image')
+                with server.LOCK:
+                    self.assertEqual(server.JOBS[jid]['status'], 'ready')
+                    files = server.JOBS[jid]['image_files']
+                self.assertEqual(len(files), 2)
+                self.assertEqual([Path(p).name for p in files], ['01.jpg', '02.jpg'])
+                self.assertFalse(list(Path(tmp, jid).glob('*.zip')))
+                # The yt-dlp command for images drops --no-playlist.
+                self.assertNotIn("--no-playlist", run.call_args[0][0])
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_single_image_na_prefix_sorts_fine(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jid = 'imgjob1'
+                with server.LOCK:
+                    server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+                def simulate(command, **kwargs):
+                    Path(tmp, jid, 'NA_ccc.jpg').write_bytes(b'\xff\xd8\xff' + b'jpg')
+                    return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+                run.side_effect = simulate
+                server.download_media(jid, 'https://www.instagram.com/p/AbCd/', 'image')
+                with server.LOCK:
+                    self.assertEqual(server.JOBS[jid]['status'], 'ready')
+                    self.assertEqual([Path(p).name for p in server.JOBS[jid]['image_files']], ['01.jpg'])
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_image_branch_rejects_video_file(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jid = 'imgjob2'
+                with server.LOCK:
+                    server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+                def simulate(command, **kwargs):
+                    Path(tmp, jid, 'clip.mp4').write_bytes(b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00video')
+                    return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+                run.side_effect = simulate
+                server.download_media(jid, 'https://www.tiktok.com/@abc/video/123', 'image')
+                with server.LOCK:
+                    self.assertEqual(server.JOBS[jid]['status'], 'error')
+                    self.assertIn('video', server.JOBS[jid]['error'])
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_image_branch_total_over_limit(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            old_max = server.MAX_BYTES
+            server.MAX_BYTES = 10
+            try:
+                jid = 'imgjob3'
+                with server.LOCK:
+                    server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+                def simulate(command, **kwargs):
+                    Path(tmp, jid, '01_a.jpg').write_bytes(b'\xff\xd8\xff' + b'x' * 20)
+                    Path(tmp, jid, '02_b.jpg').write_bytes(b'\xff\xd8\xff' + b'y' * 20)
+                    return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+                run.side_effect = simulate
+                server.download_media(jid, 'https://www.tiktok.com/@abc/photo/123', 'image')
+                with server.LOCK:
+                    self.assertEqual(server.JOBS[jid]['status'], 'error')
+                    self.assertIn('120 MB', server.JOBS[jid]['error'])
+            finally:
+                server.STORAGE = old_storage
+                server.MAX_BYTES = old_max
+
+
 class HttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -413,6 +619,80 @@ class HttpTests(unittest.TestCase):
     def test_reject_bad_format(self):
         status, body, _ = self.request('/api/download', {'url':'https://vt.tiktok.com/AAA', 'type':'exe'})
         self.assertEqual(status,400)
+
+    @patch('server.inspect_media')
+    def test_api_inspect_image_type(self, mock):
+        mock.return_value = {'title': 'Album', 'source': 'TikTok', 'images': 3}
+        status, body, _ = self.request('/api/inspect', {'url': 'https://www.tiktok.com/@abc/photo/123', 'type': 'image'})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data['images'], 3)
+        mock.assert_called_once_with('https://www.tiktok.com/@abc/photo/123', allow_playlist=True)
+
+    @patch('server.inspect_media')
+    @patch('server.POOL.submit')
+    def test_download_image_creates_job(self, submit, mock_inspect):
+        mock_inspect.return_value = {'_type': 'playlist', 'formats': [], 'images': 2}
+        status, body, _ = self.request('/api/download', {'url': 'https://www.tiktok.com/@abc/photo/123', 'type': 'image'})
+        self.assertEqual(status, 202)
+        self.assertEqual(json.loads(body)['status'], 'queued')
+        submit.assert_called_once()
+        mock_inspect.assert_called_once_with('https://www.tiktok.com/@abc/photo/123', allow_playlist=True)
+
+    @patch('server.inspect_media')
+    @patch('server.POOL.submit')
+    def test_download_image_precheck_rejects_video(self, submit, mock_inspect):
+        mock_inspect.return_value = {'_type': 'video', 'formats': [{'vcodec': 'h264', 'acodec': 'aac'}], 'images': 1}
+        status, body, _ = self.request('/api/download', {'url': 'https://www.tiktok.com/@abc/video/123', 'type': 'image'})
+        self.assertEqual(status, 422)
+        self.assertIn('video', json.loads(body)['error'])
+        submit.assert_not_called()
+
+    @patch('server.inspect_media')
+    def test_download_image_inspect_timeout(self, mock_inspect):
+        mock_inspect.side_effect = server.subprocess.TimeoutExpired('yt-dlp', 40)
+        status, body, _ = self.request('/api/download', {'url': 'https://www.tiktok.com/@abc/photo/123', 'type': 'image'})
+        self.assertEqual(status, 504)
+
+    @patch('server.inspect_media')
+    def test_download_image_inspect_oserror(self, mock_inspect):
+        mock_inspect.side_effect = OSError('no yt-dlp')
+        status, body, _ = self.request('/api/download', {'url': 'https://www.tiktok.com/@abc/photo/123', 'type': 'image'})
+        self.assertEqual(status, 422)
+
+    @patch('server.subprocess.run')
+    def test_image_job_files_served_inline(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jid = 'imgjob'
+                with server.LOCK:
+                    server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+                def simulate(command, **kwargs):
+                    folder = Path(tmp, jid)
+                    (folder / '02_aaa.jpg').write_bytes(b'\xff\xd8\xff' + b'jpg2')
+                    (folder / '01_bbb.jpg').write_bytes(b'\xff\xd8\xff' + b'jpg1')
+                    return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+                run.side_effect = simulate
+                server.download_media(jid, 'https://www.tiktok.com/@abc/photo/123', 'image')
+                status, body, _ = self.request('/api/jobs/' + jid)
+                data = json.loads(body)
+                self.assertEqual(status, 200)
+                self.assertEqual([f['name'] for f in data['files']], ['01.jpg', '02.jpg'])
+                self.assertEqual(data['files'][0]['url'], '/api/files/' + jid + '/0')
+                self.assertNotIn('download_url', data)
+                status, body, headers = self.request('/api/files/' + jid + '/0')
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b'\xff\xd8\xff' + b'jpg1')
+                self.assertEqual(headers.get('Content-Type'), 'image/jpeg')
+                self.assertIn('inline', headers.get('Content-Disposition'))
+                status, _, _ = self.request('/api/files/' + jid + '/99')
+                self.assertEqual(status, 404)
+                status, _, _ = self.request('/api/files/' + jid + '/abc')
+                self.assertEqual(status, 404)
+            finally:
+                server.STORAGE = old_storage
 
     def test_missing_file(self):
         status, body, _ = self.request('/api/files/unknown')

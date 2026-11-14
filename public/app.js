@@ -11,6 +11,9 @@ const fileReady = document.getElementById('file-ready');
 const fullButton = document.getElementById('full-download');
 const videoButton = document.getElementById('download-video');
 const audioButton = document.getElementById('download-audio');
+const imageButton = document.getElementById('download-image');
+const imageGallery = document.getElementById('image-gallery');
+const galleryHint = document.getElementById('gallery-hint');
 let activeUrl = '';
 let busy = false;
 let pollTimer = null;
@@ -29,12 +32,12 @@ function setBusy(loading) {
 }
 function validateLink(text) {
   const match = text.match(/https?:\/\/[^\s<>"']+/i);
-  if (!match) throw new Error('Hãy dán liên kết video TikTok hoặc Douyin.');
+  if (!match) throw new Error('Hãy dán liên kết TikTok, Douyin, Facebook hoặc Instagram.');
   let url;
   try { url = new URL(match[0].replace(/[.,;!?)]*$/, '')); }
   catch { throw new Error('Liên kết không hợp lệ.'); }
-  if (!/^(https?):$/.test(url.protocol) || !/(^|\.)(tiktok\.com|douyin\.com|iesdouyin\.com)$/i.test(url.hostname)) {
-    throw new Error('Chỉ nhận liên kết TikTok hoặc Douyin.');
+  if (!/^(https?):$/.test(url.protocol) || !/(^|\.)(tiktok\.com|douyin\.com|iesdouyin\.com|facebook\.com|instagram\.com|fb\.watch)$/i.test(url.hostname)) {
+    throw new Error('Chỉ nhận liên kết TikTok, Douyin, Facebook hoặc Instagram.');
   }
   return text;
 }
@@ -59,7 +62,9 @@ function showResult(data) {
   document.getElementById('video-creator').textContent = data.creator || 'TikTok';
   document.getElementById('video-origin').textContent = data.source || 'TikTok';
   const duration = document.getElementById('video-duration');
-  if (Number.isFinite(data.duration) && data.duration > 0) {
+  if (Number.isFinite(data.images) && data.images > 0) {
+    duration.textContent = `🖼 ${data.images} ảnh`;
+  } else if (Number.isFinite(data.duration) && data.duration > 0) {
     const seconds = Math.round(data.duration);
     duration.textContent = `⏱ ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
   } else { duration.textContent = 'Bài đăng công khai'; }
@@ -74,6 +79,8 @@ function showResult(data) {
   }
   jobStatus.hidden = true;
   fileReady.hidden = true;
+  imageGallery.hidden = true;
+  galleryHint.hidden = true;
   result.hidden = false;
   result.scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
@@ -82,12 +89,24 @@ form.addEventListener('submit', async e => {
   if (busy) return;
   setMessage('');
   result.hidden = true;
+  imageGallery.hidden = true;
+  galleryHint.hidden = true;
   if (pollTimer) clearTimeout(pollTimer);
   const text = input.value.trim();
   try { validateLink(text); } catch (err) { setMessage(err.message); return; }
   setBusy(true);
   try {
-    const data = await api('/api/inspect', {url: text});
+    let data;
+    try {
+      data = await api('/api/inspect', {url: text});
+    } catch (err) {
+      // A photo album/slideshow is rejected in video mode; retry as images.
+      if (/album\/playlist/i.test(err.message)) {
+        data = await api('/api/inspect', {url: text, type: 'image'});
+      } else {
+        throw err;
+      }
+    }
     activeUrl = text;
     showResult(data);
   } catch (err) { setMessage(err.message); }
@@ -109,20 +128,43 @@ document.getElementById('reset-btn').addEventListener('click', () => {
   jobStatus.hidden = true;
   fileReady.hidden = true;
   fullButton.hidden = true;
+  imageGallery.hidden = true;
+  galleryHint.hidden = true;
   if (pollTimer) clearTimeout(pollTimer);
 });
 function setDownloadBusy(value) {
   videoButton.disabled = value;
   audioButton.disabled = value;
+  imageButton.disabled = value;
   jobStatus.hidden = !value;
+}
+function renderGallery(files) {
+  imageGallery.innerHTML = '';
+  files.forEach(f => {
+    const link = document.createElement('a');
+    link.href = f.url;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    const img = document.createElement('img');
+    img.src = f.url;
+    img.alt = f.name;
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    link.appendChild(img);
+    imageGallery.appendChild(link);
+  });
+  imageGallery.hidden = false;
+  galleryHint.hidden = false;
 }
 async function startDownload(kind, mode) {
   if (!activeUrl || videoButton.disabled) return;
   setMessage('');
   fileReady.hidden = true;
   fullButton.hidden = true;
+  imageGallery.hidden = true;
+  galleryHint.hidden = true;
   setDownloadBusy(true);
-  jobText.textContent = 'Đang chuẩn bị tải ' + (kind === 'audio' ? 'MP3' : 'video') + '...';
+  jobText.textContent = 'Đang chuẩn bị tải ' + (kind === 'audio' ? 'MP3' : kind === 'image' ? 'ảnh' : 'video') + '...';
   try {
     const payload = {url: activeUrl, type: kind};
     if (mode === 'full') payload.mode = 'full';
@@ -134,6 +176,13 @@ async function startDownload(kind, mode) {
       const status = await api('/api/jobs/' + encodeURIComponent(started.job_id));
       if (status.status === 'ready') {
         setDownloadBusy(false);
+        if (status.files && Array.isArray(status.files)) {
+          // Image album: each image is served on its own so it can be
+          // saved straight into the iPhone Photos album (no zip).
+          renderGallery(status.files);
+          setMessage('Ảnh đã sẵn sàng. Nhấn giữ từng ảnh rồi chọn Lưu vào Ảnh.', 'info');
+          return;
+        }
         // V2: stream jobs carry stream_url; file jobs carry download_url.
         fileReady.href = status.stream_url || status.download_url;
         fileReady.download = 'HimTik-' + kind;
@@ -157,4 +206,5 @@ async function startDownload(kind, mode) {
 }
 videoButton.addEventListener('click', () => startDownload('video'));
 audioButton.addEventListener('click', () => startDownload('audio'));
+imageButton.addEventListener('click', () => startDownload('image'));
 fullButton.addEventListener('click', () => startDownload('video', 'full'));

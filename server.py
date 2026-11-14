@@ -42,6 +42,11 @@ MAX_BYTES = 120 * 1024 * 1024
 MAX_REQUEST = 4096
 JOB_TTL_SECONDS = 20 * 60
 MAX_JOBS = 8
+MAX_IMAGES = 50
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp")
+IMAGE_CONTENT_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                       ".webp": "image/webp", ".gif": "image/gif",
+                       ".avif": "image/avif", ".bmp": "image/bmp"}
 # Direct-URL metadata cache: one yt-dlp extraction per link per 10 minutes.
 META_CACHE_TTL_SECONDS = 10 * 60
 META_CACHE_MAX = 50
@@ -81,12 +86,17 @@ def extract_url(raw: str) -> str:
     return url
 
 
-def ytdlp_base() -> list[str]:
-    return [
+def ytdlp_base(playlist: bool = False) -> list[str]:
+    """Base yt-dlp flags. playlist=True drops --no-playlist (image albums only);
+    the default keeps it so video/audio behaviour is unchanged."""
+    base = [
         os.environ.get("YTDLP_BIN", "yt-dlp"),
-        "--no-playlist", "--no-warnings", "--no-progress",
+        "--no-warnings", "--no-progress",
         "--socket-timeout", "12", "--retries", "1", "--fragment-retries", "1",
     ]
+    if not playlist:
+        base.insert(1, "--no-playlist")
+    return base
 
 
 def _source_label(extractor_key) -> str:
@@ -101,14 +111,17 @@ def _source_label(extractor_key) -> str:
     return "TikTok"
 
 
-def inspect_media(url: str, force: bool = False) -> dict:
+def inspect_media(url: str, force: bool = False, allow_playlist: bool = False) -> dict:
     """Run yt-dlp --dump-single-json once per link (cached 10 minutes).
 
     Returns the full parsed info (display fields + formats + http_headers) so
     callers can pick a direct MP4 URL without a second extraction run.
+    With allow_playlist=True (image mode) a playlist/multi_video is accepted
+    and the image count is returned in "images"; the result is NOT cached,
+    so a playlist can never leak into the video branch.
     """
     now = time.time()
-    if not force:
+    if not force and not allow_playlist:
         with LOCK:
             hit = META_CACHE.get(url)
             if hit and now - hit["created"] < META_CACHE_TTL_SECONDS:
@@ -116,7 +129,7 @@ def inspect_media(url: str, force: bool = False) -> dict:
                 return hit["info"]
     started = time.monotonic()
     result = subprocess.run(
-        ytdlp_base() + ["--dump-single-json", "--skip-download", "--no-check-formats", url],
+        ytdlp_base(playlist=allow_playlist) + ["--dump-single-json", "--skip-download", "--no-check-formats", url],
         capture_output=True, text=True, timeout=40, check=False,
     )
     print(f"[timing] inspect {'forced' if force else 'miss'} {time.monotonic() - started:.1f}s rc={result.returncode}", flush=True)
@@ -126,10 +139,22 @@ def inspect_media(url: str, force: bool = False) -> dict:
         info = json.loads(result.stdout)
     except json.JSONDecodeError:
         raise ValueError("Nguồn video chưa được hỗ trợ. Vui lòng thử lại sau.") from None
-    if not isinstance(info, dict) or info.get("_type") in ("playlist", "multi_video"):
+    if not isinstance(info, dict):
         raise ValueError("Bài đăng dạng album/playlist chưa hỗ trợ trong phiên bản này.")
-    if not info.get("formats") and not info.get("url"):
+    is_album = info.get("_type") in ("playlist", "multi_video")
+    if is_album and not allow_playlist:
+        raise ValueError("Bài đăng dạng album/playlist chưa hỗ trợ trong phiên bản này.")
+    if not is_album and not info.get("formats") and not info.get("url"):
         raise ValueError("Không tìm thấy luồng video có thể tải cho bài đăng này.")
+    if allow_playlist:
+        if is_album:
+            image_count = len([e for e in (info.get("entries") or []) if isinstance(e, dict)])
+            if image_count == 0:
+                raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+            if image_count > MAX_IMAGES:
+                raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_IMAGES} ảnh).")
+        else:
+            image_count = 1
     parsed = {
         "title": str(info.get("title") or info.get("description") or "Video TikTok")[:150],
         "creator": str(info.get("uploader") or info.get("creator") or "TikTok")[:80],
@@ -139,10 +164,14 @@ def inspect_media(url: str, force: bool = False) -> dict:
         "formats": info.get("formats") or [],
         "http_headers": info.get("http_headers") or {},
     }
-    with LOCK:
-        META_CACHE[url] = {"created": now, "info": parsed, "raw": info}
-        while len(META_CACHE) > META_CACHE_MAX:
-            META_CACHE.pop(next(iter(META_CACHE)), None)
+    if allow_playlist:
+        parsed["images"] = image_count
+        parsed["_type"] = info.get("_type")
+    if not allow_playlist:
+        with LOCK:
+            META_CACHE[url] = {"created": now, "info": parsed, "raw": info}
+            while len(META_CACHE) > META_CACHE_MAX:
+                META_CACHE.pop(next(iter(META_CACHE)), None)
     return parsed
 
 
@@ -169,7 +198,10 @@ def raw_info_for(url: str) -> dict | None:
 
 def public_info(info: dict) -> dict:
     """Display fields for /api/inspect (no direct media URLs)."""
-    return {k: info.get(k) for k in ("title", "creator", "thumbnail", "duration", "source")}
+    out = {k: info.get(k) for k in ("title", "creator", "thumbnail", "duration", "source")}
+    if "images" in info:
+        out["images"] = info["images"]
+    return out
 
 
 def pick_direct_list(info: dict) -> list[dict]:
@@ -255,6 +287,34 @@ def is_mp4_prefix(data: bytes) -> bool:
     return len(data) >= 8 and data[4:8] == b"ftyp"
 
 
+def is_image_bytes(head: bytes, ext: str) -> bool:
+    """Validate the first bytes match the claimed image format."""
+    if ext in (".jpg", ".jpeg"):
+        return head[:3] == b"\xff\xd8\xff"
+    if ext == ".png":
+        return head[:8] == b"\x89PNG\r\n\x1a\n"
+    if ext == ".webp":
+        return len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    if ext == ".gif":
+        return head[:6] in (b"GIF87a", b"GIF89a")
+    if ext == ".bmp":
+        return head[:2] == b"BM"
+    if ext == ".avif":
+        return len(head) >= 12 and head[4:8] == b"ftyp" and head[8:12] == b"avif"
+    return False
+
+
+def _image_sort_key(path: Path) -> tuple[int, str]:
+    """Sort downloaded images by their leading playlist index. A non-numeric
+    prefix (e.g. 'NA' for a single image, whose playlist_index is empty)
+    counts as 0."""
+    prefix = path.name.split("_", 1)[0]
+    try:
+        return (int(prefix), path.name)
+    except ValueError:
+        return (0, path.name)
+
+
 class _ValidatedRedirect(urllib.request.HTTPRedirectHandler):
     """Follow redirects only to URLs that pass the same SSRF checks."""
 
@@ -322,12 +382,61 @@ def open_ytdlp_pipe(url: str, raw_info: dict | None = None):
     return proc.stdout, close_fn
 
 
+def _download_images(job_id: str, url: str, folder: Path) -> None:
+    """Download a photo post's images, one file per image (no zip).
+
+    Each image is stored as 01.<ext>, 02.<ext>, ... in post order and listed
+    in JOBS[job_id]["image_files"] for /api/jobs and /api/files to serve.
+    Raises ValueError (caught by download_media) on any failure.
+    """
+    cmd = ytdlp_base(playlist=True) + [
+        "--restrict-filenames", "--max-filesize", "120M",
+        "--output", str(folder / "%(playlist_index)02d_%(id).80s.%(ext)s"),
+    ]
+    result = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=180, check=False)
+    if result.returncode != 0:
+        raise ValueError("Không thể tải nội dung này. Nguồn có thể bị giới hạn hoặc đã thay đổi.")
+    found = [p for p in folder.iterdir() if p.is_file()]
+    images = [p for p in found if p.suffix.lower() in IMAGE_EXTENSIONS]
+    if not images:
+        video_exts = (".mp4", ".mkv", ".webm")
+        if any(p.suffix.lower() in video_exts for p in found):
+            raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
+        raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+    valid = []
+    for p in images:
+        with p.open("rb") as probe:
+            head = probe.read(12)
+        if is_image_bytes(head, p.suffix.lower()):
+            valid.append(p)
+    if not valid:
+        raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+    if len(valid) > MAX_IMAGES:
+        raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_IMAGES} ảnh).")
+    total = sum(p.stat().st_size for p in valid)
+    if not 0 < total <= MAX_BYTES:
+        raise ValueError("Tổng dung lượng ảnh vượt 120 MB.")
+    valid.sort(key=_image_sort_key)
+    renamed = []
+    for i, p in enumerate(valid, 1):
+        target = folder / f"{i:02d}{p.suffix.lower()}"
+        if target != p:
+            p.rename(target)
+        renamed.append(target)
+    with LOCK:
+        JOBS[job_id].update(status="ready", bytes=total,
+                            image_files=[str(p) for p in renamed])
+
+
 def download_media(job_id: str, url: str, file_type: str) -> None:
     folder = STORAGE / job_id
     try:
         with LOCK:
             JOBS[job_id]["status"] = "processing"
         folder.mkdir(parents=True, exist_ok=True)
+        if file_type == "image":
+            _download_images(job_id, url, folder)
+            return
         cmd = ytdlp_base() + [
             "--restrict-filenames", "--max-filesize", "120M",
             "--output", str(folder / "%(id).80s.%(ext)s"),
@@ -401,7 +510,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.3"
+    server_version = "HimTik/2.0.4"
     sys_version = ""
 
     def log_message(self, fmt, *args):
@@ -446,12 +555,23 @@ class App(BaseHTTPRequestHandler):
                 job = JOBS.get(jid)
                 payload = {k: job[k] for k in ("status", "error", "bytes") if k in job} if job else None
                 mode = job.get("mode") if job else None
+                image_files = list(job.get("image_files") or []) if job else []
             if payload is None:
                 return self.json_response(404, {"error": "Phiên tải không tồn tại hoặc đã hết hạn."})
             if payload["status"] == "ready":
                 if mode == "stream":
                     payload["mode"] = "stream"
                     payload["stream_url"] = "/api/stream/" + jid
+                elif image_files:
+                    files = []
+                    for i, p in enumerate(image_files):
+                        path = Path(p)
+                        try:
+                            size = path.stat().st_size
+                        except OSError:
+                            size = 0
+                        files.append({"name": path.name, "url": f"/api/files/{jid}/{i}", "bytes": size})
+                    payload["files"] = files
                 else:
                     payload["download_url"] = "/api/files/" + jid
             return self.json_response(200, payload)
@@ -459,21 +579,45 @@ class App(BaseHTTPRequestHandler):
             jid = route.rsplit("/", 1)[-1]
             return self.handle_stream(jid)
         if route.startswith("/api/files/"):
-            jid = route.rsplit("/", 1)[-1]
+            rest = route[len("/api/files/"):]
+            parts = rest.split("/")
+            jid = parts[0]
+            index = parts[1] if len(parts) > 1 else None
             with LOCK:
                 job = JOBS.get(jid)
-                pathname = job.get("filename") if job and job["status"] == "ready" else None
-            if not pathname:
-                return self.json_response(404, {"error": "Tệp chưa sẵn sàng hoặc đã hết hạn."})
+                image_files = list(job.get("image_files") or []) if job else []
+                filename = job.get("filename") if job and job["status"] == "ready" else None
+            if index is not None:
+                # Image album: index is digits only and used as a list index
+                # into job["image_files"]; never joined into a file path.
+                if not index.isdigit():
+                    return self.json_response(404, {"error": "Tệp chưa sẵn sàng hoặc đã hết hạn."})
+                idx = int(index)
+                if not job or job.get("status") != "ready" or idx >= len(image_files):
+                    return self.json_response(404, {"error": "Tệp chưa sẵn sàng hoặc đã hết hạn."})
+                pathname = image_files[idx]
+                is_image = True
+            else:
+                if not filename:
+                    return self.json_response(404, {"error": "Tệp chưa sẵn sàng hoặc đã hết hạn."})
+                pathname = filename
+                is_image = False
             path = Path(pathname)
             if not path.is_file() or path.parent != STORAGE / jid:
                 return self.json_response(404, {"error": "Tệp tải không còn tồn tại."})
-            file_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-            name = "HimTik-" + jid[:8] + path.suffix.lower()
+            suffix = path.suffix.lower()
+            if is_image:
+                file_type = IMAGE_CONTENT_TYPES.get(suffix) or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+                name = path.name
+                disposition = "inline"
+            else:
+                file_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+                name = "HimTik-" + jid[:8] + suffix
+                disposition = "attachment"
             self.send_response(200)
             self.send_header("Content-Type", file_type)
             self.send_header("Content-Length", str(path.stat().st_size))
-            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Content-Disposition", f'{disposition}; filename="{name}"')
             self.headers_common()
             self.end_headers()
             try:
@@ -641,8 +785,9 @@ class App(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as exc:
             return self.json_response(400, {"error": str(exc) or "Dữ liệu không hợp lệ."})
         if route == "/api/inspect":
+            inspect_type = payload.get("type", "video")
             try:
-                return self.json_response(200, public_info(inspect_media(url)))
+                return self.json_response(200, public_info(inspect_media(url, allow_playlist=(inspect_type == "image"))))
             except subprocess.TimeoutExpired:
                 return self.json_response(504, {"error": "Nguồn phản hồi quá chậm. Vui lòng thử lại."})
             except ValueError as exc:
@@ -650,7 +795,7 @@ class App(BaseHTTPRequestHandler):
             except OSError:
                 return self.json_response(422, {"error": "Máy chủ chưa cài yt-dlp hoặc FFmpeg."})
         file_type = payload.get("type", "video")
-        if file_type not in ("video", "audio"):
+        if file_type not in ("video", "audio", "image"):
             return self.json_response(400, {"error": "Định dạng không hỗ trợ."})
         mode = payload.get("mode", "stream")
         if file_type == "video" and mode != "full":
@@ -676,6 +821,20 @@ class App(BaseHTTPRequestHandler):
                 print(f"[timing] download stream-ready format={direct['format_id']} bytes={direct['filesize']} candidates={len(direct_list)}", flush=True)
                 return self.json_response(202, {"job_id": jid, "status": "ready",
                                                 "mode": "stream", "stream_url": "/api/stream/" + jid})
+        if file_type == "image":
+            # Pre-check: refuse video posts before downloading up to 120 MB.
+            try:
+                info = inspect_media(url, allow_playlist=True)
+            except subprocess.TimeoutExpired:
+                return self.json_response(504, {"error": "Nguồn phản hồi quá chậm. Vui lòng thử lại."})
+            except ValueError as exc:
+                return self.json_response(422, {"error": str(exc)})
+            except OSError:
+                return self.json_response(422, {"error": "Máy chủ chưa cài yt-dlp hoặc FFmpeg."})
+            if info.get("_type") not in ("playlist", "multi_video"):
+                if any(isinstance(f, dict) and f.get("vcodec") not in (None, "none")
+                       for f in (info.get("formats") or [])):
+                    return self.json_response(422, {"error": "Bài đăng này là video, hãy chọn loại Video."})
         with LOCK:
             in_progress = sum(1 for j in JOBS.values() if j["status"] in ("queued", "processing"))
             if in_progress >= MAX_JOBS:

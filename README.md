@@ -9,12 +9,13 @@ V2 ưu tiên tốc độ: video được **truyền trực tiếp (stream)** t�
 - Giao diện tiếng Việt, responsive, Liquid Glass tối, không cần CDN/font ngoài.
 - Dán link bài đăng công khai, xem trước tiêu đề, tác giả, thumbnail và thời lượng (nếu dữ liệu có sẵn).
 - Tải video nguồn có sẵn (ưu tiên MP4), tách MP3 bằng FFmpeg.
+- **Tải ảnh (V2.0.4):** slideshow/album ảnh và ảnh đơn từ TikTok/Instagram/Facebook. Mỗi ảnh được trả riêng (không nén zip) để mở rồi nhấn giữ lưu thẳng vào ứng dụng Ảnh trên iPhone. Tối đa 50 ảnh/album, tổng tối đa 120 MB.
 - **V2 — video stream trực tiếp:** `POST /api/download` (video) trả job `ready` kèm `stream_url` ngay khi tìm được link MP4 trực tiếp; trình duyệt mở `GET /api/stream/{id}` và nhận video theo luồng, không chờ máy chủ tải xong. Stream chạy bằng yt-dlp được nạp sẵn metadata đã cache (`--load-info-json`) nên mỗi link chỉ trích xuất một lần — không thử tải trực tiếp link CDN bằng HTTP thường nữa vì TikTok chặn kiểu tải đó từ IP máy chủ. Nếu stream lỗi thì server trả `fallback: "full"` để client dùng bản tải đầy đủ (`/api/files/{id}`).
 - **V2 — cache metadata:** mỗi link chỉ chạy `yt-dlp --dump-single-json` một lần trong 10 phút; lần tải lại sau dùng cache.
 - Hàng đợi tải, trạng thái và thông báo lỗi; tệp tạm tự xóa sau khoảng 20 phút.
 - Chỉ cho phép link TikTok/Douyin/Facebook/Instagram; giới hạn 120 MB/tệp, không giới hạn tốc độ, không lấy thông tin đăng nhập.
 
-**Không hỗ trợ trong V2:** album ảnh/slideshow, hàng loạt, video riêng tư, lưu trực tiếp vào Thư viện Ảnh iPhone (iOS bắt buộc thao tác Chia sẻ → Lưu video), cam kết tải không logo/4K mọi bài đăng, tua/seek (Range) khi xem stream. Nguồn media phụ thuộc yt-dlp và mức truy cập TikTok/Douyin/Facebook/Instagram tại thời điểm chạy.
+**Không hỗ trợ trong V2:** hàng loạt, video riêng tư, lưu trực tiếp vào Thư viện Ảnh iPhone (iOS bắt buộc thao tác Chia sẻ → Lưu video), cam kết tải không logo/4K mọi bài đăng, tua/seek (Range) khi xem stream. Nguồn media phụ thuộc yt-dlp và mức truy cập TikTok/Douyin/Facebook/Instagram tại thời điểm chạy.
 
 ## Chạy thử trên máy tính
 
@@ -57,6 +58,8 @@ Kiểm thử mock chỉ chứng minh định tuyến và kiểm tra dữ liệu;
 
 `public/index.html` giao diện, `public/style.css` theme, `public/app.js` xử lý fetch/polling, `server.py` HTTP server / queue / yt-dlp, `Dockerfile` cài ffmpeg và yt-dlp, `render.yaml` deploy.
 
-API: `POST /api/inspect`, `POST /api/download`, `GET /api/jobs/{id}`, `GET /api/files/{id}`, `GET /api/stream/{id}`, `GET /api/health`.
+API: `POST /api/inspect`, `POST /api/download`, `GET /api/jobs/{id}`, `GET /api/files/{id}`, `GET /api/files/{id}/{index}`, `GET /api/stream/{id}`, `GET /api/health`.
 
 Luồng video V2: `POST /api/download {"url", "type": "video"}` → job `ready` + `stream_url` (hoặc `queued` nếu phải tải đầy đủ) → `GET /api/stream/{id}` truyền MP4 trực tiếp (`Content-Disposition: inline`, kiểm tra magic `ftyp` trước khi gửi header) → lỗi thì client gọi lại `POST /api/download {"mode": "full"}` rồi lấy `GET /api/files/{id}`. MP3 luôn đi đường tải đầy đủ.
+
+Luồng ảnh (V2.0.4): `POST /api/download {"url", "type": "image"}` → server kiểm tra trước bằng `inspect_media` (chế độ ảnh, không dùng cache): bài video thì trả 422 "Bài đăng này là video, hãy chọn loại Video."; bài ảnh thì tạo job tải đầy đủ (không stream, không zip) → `GET /api/jobs/{id}` trả `files: [{name, url: "/api/files/{id}/0", bytes}, ...]` → mỗi ảnh lấy riêng qua `GET /api/files/{id}/{index}` (`Content-Disposition: inline`, `Content-Type` theo đuôi ảnh) để mở trực tiếp rồi nhấn giữ lưu vào Ảnh. `POST /api/inspect` nhận thêm `"type": "image"` để trả trường `images` (số ảnh trong bài).
