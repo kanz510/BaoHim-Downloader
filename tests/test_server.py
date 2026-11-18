@@ -5,9 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
-import zipfile
 from http.server import ThreadingHTTPServer
-from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -424,7 +422,7 @@ class GalleryTests(unittest.TestCase):
                 server.STORAGE = old_storage
 
     @patch('server.subprocess.run')
-    def test_gallery_multiple_images_zipped(self, run):
+    def test_gallery_multiple_images_served_as_files(self, run):
         with tempfile.TemporaryDirectory() as tmp:
             old_storage = server.STORAGE
             server.STORAGE = Path(tmp)
@@ -440,12 +438,11 @@ class GalleryTests(unittest.TestCase):
                 self.assertEqual(job['found'], 3)
                 self.assertEqual(job['downloaded'], 3)
                 self.assertNotIn('warning', job)
-                self.assertNotIn('image_files', job)
-                self.assertTrue(job['filename'].endswith('photos.zip'))
-                self.assertEqual(job['bytes'], Path(job['filename']).stat().st_size)
-                with zipfile.ZipFile(job['filename']) as zf:
-                    self.assertEqual(zf.namelist(), ['01.jpg', '02.jpg', '03.jpg'])
-                    self.assertEqual(zf.read('02.jpg'), jpgs[1])
+                self.assertNotIn('filename', job)  # 2.0.6: no zip, individual files
+                self.assertEqual([Path(p).name for p in job['image_files']],
+                                 ['01.jpg', '02.jpg', '03.jpg'])
+                self.assertEqual(job['bytes'], sum(len(j) for j in jpgs))
+                self.assertEqual(Path(job['image_files'][1]).read_bytes(), jpgs[1])
             finally:
                 server.STORAGE = old_storage
 
@@ -505,7 +502,9 @@ class GalleryTests(unittest.TestCase):
                 self.assertEqual(job['found'], 8)
                 self.assertEqual(job['downloaded'], 3)
                 self.assertEqual(job['warning'], 'Chỉ tải được 3/8 ảnh.')
-                self.assertTrue(job['filename'].endswith('photos.zip'))
+                self.assertNotIn('filename', job)  # 2.0.6: no zip, individual files
+                self.assertEqual([Path(p).name for p in job['image_files']],
+                                 ['01.jpg', '02.jpg', '03.jpg'])
             finally:
                 server.STORAGE = old_storage
 
@@ -541,6 +540,204 @@ class GalleryTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)  # probe only, no download attempt
             finally:
                 server.STORAGE = old_storage
+
+
+class _FakeHTTPResponse:
+    """Minimal urllib response for the Facebook parser tests."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, n=-1):
+        return self._data if n < 0 else self._data[:n]
+
+
+class _FakeOpener:
+    """Fake urllib opener: serves canned byte responses in call order."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def open(self, request, timeout=None):
+        self.calls.append(request)
+        return _FakeHTTPResponse(self._responses.pop(0))
+
+
+class FacebookParserTests(unittest.TestCase):
+    """Facebook og:image parser fallback (2.0.6)."""
+
+    FB_COOKIE_TEXT = ('# Netscape HTTP Cookie File\n'
+                      '.facebook.com\tTRUE\t/\tTRUE\t0\tc_user\t123')
+
+    def setUp(self):
+        with server.LOCK:
+            server.META_CACHE.clear()
+            server.JOBS.clear()
+
+    def _cookie_file(self, tmp):
+        path = Path(tmp, 'fb_cookies.txt')
+        path.write_text(self.FB_COOKIE_TEXT)
+        return str(path)
+
+    def _page(self, image_url=None, video=False):
+        parts = ['<html><head>']
+        if video:
+            parts.append('<meta property="og:video" content="https://example.com/v.mp4">')
+        if image_url:
+            parts.append('<meta property="og:image" content="%s">' % image_url)
+        parts.append('</head><body>photo</body></html>')
+        return ''.join(parts).encode('utf-8')
+
+    def test_og_image_url_extraction(self):
+        html1 = ('<meta property="og:image" content="https://scontent.example.com/a.jpg'
+                 '?x=1&amp;y=2">')
+        self.assertEqual(server._facebook_og_image_url(html1),
+                         'https://scontent.example.com/a.jpg?x=1&y=2')
+        html2 = ('<meta content="https://scontent.example.com/b.png" '
+                 'property="og:image">')
+        self.assertEqual(server._facebook_og_image_url(html2),
+                         'https://scontent.example.com/b.png')
+        self.assertIsNone(server._facebook_og_image_url('<html><head></head></html>'))
+        self.assertIsNone(server._facebook_og_image_url(
+            '<meta property="og:image:secure_url" content="https://example.com/c.jpg">'))
+
+    def _parser_job(self, tmp, jid, url, opener, cookie_file):
+        with server.LOCK:
+            server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+        folder = Path(tmp, jid)
+        folder.mkdir(parents=True, exist_ok=True)
+        with patch('server.urllib.request.build_opener', return_value=opener):
+            server._download_images_facebook_parser(jid, url, folder, cookie_file)
+        with server.LOCK:
+            return dict(server.JOBS[jid])
+
+    def test_parser_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img = b'\xff\xd8\xff' + b'fbimg'
+            page = self._page('https://scontent.example.com/photo.jpg?stp=abc&amp;oh=123')
+            opener = _FakeOpener([page, img])
+            job = self._parser_job(tmp, 'fbp1', 'https://www.facebook.com/photo.php?fbid=1',
+                                   opener, self._cookie_file(tmp))
+            self.assertEqual(job['status'], 'ready')
+            self.assertEqual(job['found'], 1)
+            self.assertEqual(job['downloaded'], 1)
+            self.assertEqual(job['bytes'], len(img))
+            self.assertEqual([Path(p).name for p in job['image_files']], ['01.jpg'])
+            self.assertEqual(Path(job['image_files'][0]).read_bytes(), img)
+            self.assertEqual(len(opener.calls), 2)
+            self.assertEqual(opener.calls[0].full_url,
+                             'https://www.facebook.com/photo.php?fbid=1')
+            self.assertEqual(opener.calls[1].full_url,
+                             'https://scontent.example.com/photo.jpg?stp=abc&oh=123')
+
+    def test_parser_no_og_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            opener = _FakeOpener([self._page()])
+            with self.assertRaises(ValueError) as cm:
+                self._parser_job(tmp, 'fbp2', 'https://www.facebook.com/photo.php?fbid=1',
+                                 opener, self._cookie_file(tmp))
+            self.assertIn('Không tìm thấy ảnh', str(cm.exception))
+
+    def test_parser_video_post_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            opener = _FakeOpener([self._page('https://scontent.example.com/t.jpg', video=True)])
+            with self.assertRaises(ValueError) as cm:
+                self._parser_job(tmp, 'fbp3', 'https://www.facebook.com/photo.php?fbid=1',
+                                 opener, self._cookie_file(tmp))
+            self.assertIn('video', str(cm.exception))
+
+    def _fallback_job(self, tmp, jid, url, simulate, opener, env):
+        with server.LOCK:
+            server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+        old_storage = server.STORAGE
+        server.STORAGE = Path(tmp)
+        try:
+            with patch('server.subprocess.run') as run, \
+                 patch('server.urllib.request.build_opener', return_value=opener), \
+                 patch.dict(os.environ, env):
+                run.side_effect = simulate
+                server.download_media(jid, url, 'image')
+        finally:
+            server.STORAGE = old_storage
+        with server.LOCK:
+            return dict(server.JOBS[jid])
+
+    def _gallery_fail_simulate(self, probe_rc=1, probe_stderr=''):
+        def simulate(command, **kwargs):
+            if '--get-urls' in command:
+                return type('Result', (), {'returncode': probe_rc, 'stdout': '',
+                                           'stderr': probe_stderr})()
+            return type('Result', (), {'returncode': 1, 'stdout': '', 'stderr': ''})()
+        return simulate
+
+    def test_gallery_facebook_falls_back_to_parser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img = b'\xff\xd8\xff' + b'fbimg'
+            page = self._page('https://scontent.example.com/photo.jpg')
+            opener = _FakeOpener([page, img])
+            simulate = self._gallery_fail_simulate(
+                probe_stderr="[facebook][error] An unexpected error occurred: KeyError - 'fbid'.")
+            job = self._fallback_job(tmp, 'fbf1', 'https://www.facebook.com/photo.php?fbid=1',
+                                     simulate, opener,
+                                     {'FB_COOKIES': self.FB_COOKIE_TEXT})
+            self.assertEqual(job['status'], 'ready')
+            self.assertEqual(job['found'], 1)
+            self.assertEqual(job['downloaded'], 1)
+            self.assertEqual([Path(p).name for p in job['image_files']], ['01.jpg'])
+            self.assertEqual(len(opener.calls), 2)
+
+    def test_gallery_facebook_no_fallback_on_login(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            opener = _FakeOpener([b'<html></html>'])
+            simulate = self._gallery_fail_simulate(
+                probe_rc=16,
+                probe_stderr='[facebook][error] AuthRequired: You must be logged in to continue viewing images.')
+            job = self._fallback_job(tmp, 'fbf2', 'https://www.facebook.com/photo.php?fbid=1',
+                                     simulate, opener,
+                                     {'FB_COOKIES': self.FB_COOKIE_TEXT})
+            self.assertEqual(job['status'], 'error')
+            self.assertEqual(job['error'], 'Bài này cần đăng nhập, cookie có thể đã hết hạn.')
+            self.assertEqual(opener.calls, [])
+
+    def test_gallery_facebook_no_fallback_on_video(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            opener = _FakeOpener([b'<html></html>'])
+
+            def simulate(command, **kwargs):
+                if '--get-urls' in command:
+                    return type('Result', (), {'returncode': 0,
+                                               'stdout': 'https://cdn.example.com/clip.mp4\n',
+                                               'stderr': ''})()
+                folder = Path(tmp, 'fbf3')
+                (folder / 'facebook' / 'user').mkdir(parents=True, exist_ok=True)
+                (folder / 'facebook' / 'user' / 'clip.mp4').write_bytes(
+                    b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00video')
+                return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+
+            job = self._fallback_job(tmp, 'fbf3', 'https://www.facebook.com/photo.php?fbid=1',
+                                     simulate, opener,
+                                     {'FB_COOKIES': self.FB_COOKIE_TEXT})
+            self.assertEqual(job['status'], 'error')
+            self.assertIn('video', job['error'])
+            self.assertEqual(opener.calls, [])
+
+    def test_gallery_instagram_no_parser_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            opener = _FakeOpener([b'<html></html>'])
+            simulate = self._gallery_fail_simulate(
+                probe_stderr='[instagram][error] HTTP 429 Too Many Requests')
+            job = self._fallback_job(tmp, 'fbf4', 'https://www.instagram.com/p/AbCd/',
+                                     simulate, opener, {})
+            self.assertEqual(job['status'], 'error')
+            self.assertEqual(job['error'], 'Không đọc được bài đăng. Hãy thử liên kết công khai khác.')
+            self.assertEqual(opener.calls, [])
 
 
 class HttpTests(unittest.TestCase):
@@ -891,12 +1088,12 @@ class HttpTests(unittest.TestCase):
         mock_inspect.assert_not_called()
 
     @patch('server.subprocess.run')
-    def test_gallery_zip_job_payload_and_download(self, run):
+    def test_gallery_multi_image_job_payload_and_files(self, run):
         with tempfile.TemporaryDirectory() as tmp:
             old_storage = server.STORAGE
             server.STORAGE = Path(tmp)
             try:
-                jid = 'galzip'
+                jid = 'galfiles'
                 with server.LOCK:
                     server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
                 def simulate(command, **kwargs):
@@ -918,14 +1115,18 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(data['found'], 2)
                 self.assertEqual(data['downloaded'], 2)
                 self.assertNotIn('warning', data)
-                self.assertNotIn('files', data)
-                self.assertEqual(data['download_url'], '/api/files/' + jid)
-                status, body, headers = self.request('/api/files/' + jid)
+                self.assertNotIn('download_url', data)  # 2.0.6: no zip
+                self.assertEqual([f['name'] for f in data['files']], ['01.jpg', '02.jpg'])
+                self.assertEqual(data['files'][0]['url'], '/api/files/' + jid + '/0')
+                self.assertEqual(data['files'][1]['url'], '/api/files/' + jid + '/1')
+                status, body, headers = self.request('/api/files/' + jid + '/0')
                 self.assertEqual(status, 200)
-                self.assertEqual(headers.get('Content-Type'), 'application/zip')
-                self.assertIn('attachment', headers.get('Content-Disposition'))
-                with zipfile.ZipFile(BytesIO(body)) as zf:
-                    self.assertEqual(zf.namelist(), ['01.jpg', '02.jpg'])
+                self.assertEqual(body, b'\xff\xd8\xff' + b'a')
+                self.assertEqual(headers.get('Content-Type'), 'image/jpeg')
+                self.assertIn('inline', headers.get('Content-Disposition'))
+                status, body, headers = self.request('/api/files/' + jid + '/1')
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b'\xff\xd8\xff' + b'b')
             finally:
                 server.STORAGE = old_storage
 
