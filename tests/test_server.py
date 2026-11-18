@@ -547,8 +547,11 @@ class GalleryTests(unittest.TestCase):
 class _FakeHTTPResponse:
     """Minimal urllib response for the Facebook parser tests."""
 
-    def __init__(self, data):
+    def __init__(self, data, url='https://www.facebook.com/photo.php?fbid=1',
+                 status=200):
         self._data = data
+        self._url = url
+        self.status = status
 
     def __enter__(self):
         return self
@@ -558,6 +561,9 @@ class _FakeHTTPResponse:
 
     def read(self, n=-1):
         return self._data if n < 0 else self._data[:n]
+
+    def geturl(self):
+        return self._url
 
 
 class _FakeUrlopen:
@@ -569,7 +575,10 @@ class _FakeUrlopen:
 
     def __call__(self, request, timeout=None):
         self.calls.append(request)
-        return _FakeHTTPResponse(self._responses.pop(0))
+        item = self._responses.pop(0)
+        if isinstance(item, _FakeHTTPResponse):
+            return item
+        return _FakeHTTPResponse(item)
 
 
 class FacebookParserTests(unittest.TestCase):
@@ -677,15 +686,15 @@ class FacebookParserTests(unittest.TestCase):
     def test_parser_no_og_image_reports_page_title(self):
         # 2.0.9: when the page has no og:image, the error names the page
         # title so the live diagnosis can tell what Facebook served.
+        # 2.0.10 appends the diagnostic line after the title.
         with tempfile.TemporaryDirectory() as tmp:
             page = b'<html><head><title>Content Not Found | Facebook</title></head></html>'
             opener = _FakeUrlopen([page])
             with self.assertRaises(ValueError) as cm:
                 self._parser_job(tmp, 'fbp4', 'https://www.facebook.com/photo.php?fbid=1',
                                  opener, self._cookie_file(tmp))
-            self.assertEqual(str(cm.exception),
-                             'Không tìm thấy ảnh nào trong bài đăng này. '
-                             '(Trang: Content Not Found | Facebook)')
+            self.assertIn('(Trang: Content Not Found | Facebook)', str(cm.exception))
+            self.assertIn('[Chẩn đoán:', str(cm.exception))
 
     def test_parser_page_http_error_reports_status(self):
         # 2.0.9: an HTTP error while fetching the page reports its status.
@@ -697,6 +706,66 @@ class FacebookParserTests(unittest.TestCase):
                 self._parser_job(tmp, 'fbp5', 'https://www.facebook.com/photo.php?fbid=1',
                                  _RaisingUrlopen(), self._cookie_file(tmp))
             self.assertIn('HTTP 404', str(cm.exception))
+
+    def test_cookie_header_info(self):
+        # 2.0.10: the diagnostic reports cookie names (never values),
+        # c_user/xs presence, duplicates and the header length.
+        info = server._cookie_header_info('c_user=123; xs=SECRETVALUE; sb=abc; xs=OTHER')
+        self.assertEqual(info['names'], ['c_user', 'xs', 'sb', 'xs'])
+        self.assertEqual(info['duplicates'], ['xs'])
+        self.assertTrue(info['has_c_user'])
+        self.assertTrue(info['has_xs'])
+        self.assertEqual(info['length'], len('c_user=123; xs=SECRETVALUE; sb=abc; xs=OTHER'))
+        self.assertNotIn('SECRETVALUE', str(info))
+
+    def test_user_id_info(self):
+        # 2.0.10: USER_ID presence and whether it matches c_user.
+        # Verified 2026-11-19: a logged-out FB page has NO USER_ID field
+        # at all, so "USER_ID":"0" is NOT a logged-out marker — absence
+        # means the page is a shell/error page.
+        self.assertEqual(server._user_id_info('<html></html>', '123'), (False, False))
+        self.assertEqual(server._user_id_info('"USER_ID":"123"', '123'), (True, True))
+        self.assertEqual(server._user_id_info('"USER_ID":"0"', '123'), (True, False))
+        self.assertEqual(server._user_id_info('"USER_ID":"999"', '123'), (True, False))
+        self.assertEqual(server._user_id_info('"USER_ID":"123"', None), (True, False))
+
+    def test_facebook_diagnostic_never_includes_cookie_values(self):
+        # 2.0.10: the diagnostic line must never leak a cookie value,
+        # even when the header contains a distinctive secret.
+        diag = server._facebook_diagnostic(
+            'https://www.facebook.com/login/?next=x', 200, 1542,
+            'c_user=123; xs=TOPSECRETVALUE; sb=abc',
+            '<html><head><title>Facebook</title></head></html>')
+        self.assertIn('URL cuối: /login/', diag)
+        self.assertIn('HTTP 200', diag)
+        self.assertIn('body 1542 B', diag)
+        self.assertIn('c_user có', diag)
+        self.assertIn('xs có', diag)
+        self.assertIn('USER_ID: không', diag)
+        self.assertIn('khớp c_user: sai', diag)
+        self.assertNotIn('TOPSECRETVALUE', diag)
+        self.assertNotIn('123', diag)
+
+    def test_parser_no_og_image_includes_diagnostic(self):
+        # 2.0.10: the live error carries the final URL, status, body
+        # length, cookie names and USER_ID match — and no cookie value.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = (b'<html><head><title>Facebook</title></head><body>'
+                    b'"USER_ID":"123"</body></html>')
+            resp = _FakeHTTPResponse(page, url='https://www.facebook.com/photo.php?fbid=1')
+            opener = _FakeUrlopen([resp])
+            with self.assertRaises(ValueError) as cm:
+                self._parser_job(tmp, 'fbp7', 'https://www.facebook.com/photo.php?fbid=1',
+                                 opener, self._cookie_file(tmp))
+            msg = str(cm.exception)
+            self.assertIn('URL cuối: /photo.php', msg)
+            self.assertIn('HTTP 200', msg)
+            self.assertIn('body %d B' % len(page), msg)
+            self.assertIn('c_user có', msg)
+            self.assertIn('xs không', msg)
+            self.assertIn('USER_ID: có', msg)
+            self.assertIn('khớp c_user: đúng', msg)
+            self.assertNotIn('123', msg)
 
     def test_parser_video_post_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -792,7 +861,8 @@ class FacebookParserTests(unittest.TestCase):
                                      simulate, opener,
                                      {'FB_COOKIES': self.FB_COOKIE_TEXT})
             self.assertEqual(job['status'], 'error')
-            self.assertEqual(job['error'], 'Không tìm thấy ảnh nào trong bài đăng này.')
+            self.assertTrue(job['error'].startswith('Không tìm thấy ảnh nào trong bài đăng này.'))
+            self.assertIn('[Chẩn đoán:', job['error'])
             self.assertEqual(len(opener.calls), 1)
 
     def test_parser_login_page_reports_login_error(self):
