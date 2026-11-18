@@ -2,6 +2,13 @@
 
 For TikTok/Douyin/Facebook/Instagram public posts only. Doesn't claim guaranteed no-watermark access.
 
+Photo posts from Instagram and Facebook go through gallery-dl instead:
+yt-dlp cannot read them (IG photo posts report "No video formats found",
+FB requires a login). gallery-dl runs without cookies by default; optional
+IG_COOKIES / FB_COOKIES env vars (Netscape format) are written to a temp
+file at runtime and passed with --cookies, never logged or stored in the
+repo. One image is served as a single file; several are zipped.
+
 V2: video downloads prefer direct streaming. POST /api/download first resolves the
 post's direct MP4 URL (cached metadata) and returns a ready stream job; the client
 then fetches GET /api/stream/<job> and the server pipes the video straight through
@@ -29,6 +36,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +51,18 @@ MAX_REQUEST = 4096
 JOB_TTL_SECONDS = 20 * 60
 MAX_JOBS = 8
 MAX_IMAGES = 50
+# gallery-dl image path (Instagram/Facebook photo posts, which yt-dlp cannot
+# read): probe timeout 60 s; download timeout 180 s like the yt-dlp download
+# path, because up to 30 images need more than a minute on the free tier.
+GALLERY_PROBE_TIMEOUT = 60
+GALLERY_DOWNLOAD_TIMEOUT = 180
+MAX_GALLERY_IMAGES = 30
+# Phrases gallery-dl prints when the post needs a logged-in session.
+_GALLERY_LOGIN_MARKERS = (
+    "must be logged in", "redirect to login", "authrequired",
+    "login required", "not logged in", "authentication required",
+    "log in to continue",
+)
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp")
 IMAGE_CONTENT_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                        ".webp": "image/webp", ".gif": "image/gif",
@@ -428,6 +448,180 @@ def _download_images(job_id: str, url: str, folder: Path) -> None:
                             image_files=[str(p) for p in renamed])
 
 
+def _gallery_platform(url: str) -> str | None:
+    """'instagram' or 'facebook' when the link is an IG/FB post, else None.
+
+    Only these two go through gallery-dl: yt-dlp cannot read their photo
+    posts (IG: "No video formats found", FB: login wall), while TikTok and
+    Douyin photo posts stay on the yt-dlp path (and TikTok images in the
+    iPhone Shortcut stay on the TikWM fast path).
+    """
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        return "instagram"
+    if host == "facebook.com" or host.endswith(".facebook.com"):
+        return "facebook"
+    return None
+
+
+def _gallery_cookie_file(platform: str) -> str | None:
+    """Write the platform's optional cookie env var (Netscape format) to a
+    temp file and return its path; None when the env var is unset/empty.
+
+    The caller deletes the file after the gallery-dl run. The content is
+    never logged and never written into the repo. IG_COOKIES / FB_COOKIES
+    are set in the Render dashboard by the service owner, never pasted
+    into chat. (tempfile.mkstemp creates the file with mode 0600.)
+    """
+    content = os.environ.get("IG_COOKIES" if platform == "instagram" else "FB_COOKIES", "")
+    if not content.strip():
+        return None
+    fd, path = tempfile.mkstemp(prefix="himtik-cookies-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+    except OSError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    return path
+
+
+def _gallery_cmd(cookie_file: str | None) -> list[str]:
+    """gallery-dl base command (argument list, never shell=True)."""
+    cmd = ["gallery-dl"]
+    if cookie_file:
+        cmd += ["--cookies", cookie_file]
+    return cmd
+
+
+def _gallery_login_required(output: str) -> bool:
+    """True when gallery-dl's output says the post needs a login."""
+    text = output.lower()
+    return any(marker in text for marker in _GALLERY_LOGIN_MARKERS)
+
+
+def _gallery_login_error(cookie_file: str | None) -> str:
+    """The login-required message: plain when no cookies are configured,
+    expired-cookie hint when cookies were sent but still refused."""
+    if cookie_file:
+        return "Bài này cần đăng nhập, cookie có thể đã hết hạn."
+    return "Bài này cần đăng nhập, chưa có cookie."
+
+
+def _gallery_probe(url: str, cookie_file: str | None) -> int:
+    """Count the media URLs gallery-dl finds for the post, without
+    downloading. Raises ValueError (user-facing message) on login, on an
+    unreadable post, or when nothing is found."""
+    cmd = _gallery_cmd(cookie_file) + ["--get-urls", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=GALLERY_PROBE_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        raise ValueError("Nguồn phản hồi quá chậm. Vui lòng thử lại.")
+    except OSError:
+        raise ValueError("Máy chủ chưa cài gallery-dl.")
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    if _gallery_login_required(output):
+        raise ValueError(_gallery_login_error(cookie_file))
+    if result.returncode != 0:
+        raise ValueError("Không đọc được bài đăng. Hãy thử liên kết công khai khác.")
+    urls = [line.strip() for line in (result.stdout or "").splitlines()
+            if line.strip().startswith("http")]
+    if not urls:
+        raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+    return len(urls)
+
+
+def _download_images_gallery(job_id: str, url: str, folder: Path) -> None:
+    """Instagram/Facebook photo posts via gallery-dl.
+
+    Probe first for the found count, then download into the job folder.
+    One image is served as a single file (same as the yt-dlp path); several
+    are zipped into photos.zip and served through /api/files/<job>.
+    A partial download is still returned, with found/downloaded/warning on
+    the job. Raises ValueError (caught by download_media) on any failure.
+    """
+    platform = _gallery_platform(url) or "instagram"
+    cookie_file = _gallery_cookie_file(platform)
+    try:
+        found = _gallery_probe(url, cookie_file)
+        if found > MAX_GALLERY_IMAGES:
+            raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_GALLERY_IMAGES} ảnh).")
+        cmd = _gallery_cmd(cookie_file) + ["-d", str(folder), url]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=GALLERY_DOWNLOAD_TIMEOUT, check=False)
+        except subprocess.TimeoutExpired:
+            raise ValueError("Quá thời gian xử lý. Hãy thử album ít ảnh hơn.")
+        except OSError:
+            raise ValueError("Máy chủ chưa cài gallery-dl.")
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        if _gallery_login_required(output):
+            raise ValueError(_gallery_login_error(cookie_file))
+        if result.returncode != 0:
+            raise ValueError("Không tải được ảnh từ bài đăng này.")
+        # gallery-dl writes into extractor subfolders; collect recursively.
+        found_files = [p for p in sorted(folder.rglob("*")) if p.is_file()]
+        images = [p for p in found_files if p.suffix.lower() in IMAGE_EXTENSIONS]
+        valid = []
+        for p in images:
+            with p.open("rb") as probe:
+                head = probe.read(12)
+            if is_image_bytes(head, p.suffix.lower()):
+                valid.append(p)
+        if not valid:
+            video_exts = (".mp4", ".mkv", ".webm", ".mov")
+            if any(p.suffix.lower() in video_exts for p in found_files):
+                raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
+            raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+        downloaded = len(valid)
+        if downloaded > MAX_GALLERY_IMAGES:
+            # The probe already capped this; a post can gain items between
+            # probe and download, so check again here.
+            raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_GALLERY_IMAGES} ảnh).")
+        total = sum(p.stat().st_size for p in valid)
+        if not 0 < total <= MAX_BYTES:
+            raise ValueError("Tổng dung lượng ảnh vượt 120 MB.")
+        # Flatten to 01.<ext>, 02.<ext>, ... in post order. Two-phase
+        # rename: a file may already carry a target name.
+        staged = []
+        for i, p in enumerate(valid, 1):
+            temp = folder / f".g{i:02d}{p.suffix.lower()}"
+            p.rename(temp)
+            staged.append(temp)
+        renamed = []
+        for i, temp in enumerate(staged, 1):
+            target = folder / f"{i:02d}{temp.suffix.lower()}"
+            temp.rename(target)
+            renamed.append(str(target))
+        warning = ""
+        if downloaded < found:
+            warning = f"Chỉ tải được {downloaded}/{found} ảnh."
+        with LOCK:
+            job = JOBS[job_id]
+            job.update(status="ready", bytes=total, found=found, downloaded=downloaded)
+            if warning:
+                job["warning"] = warning
+            if len(renamed) == 1:
+                job["image_files"] = renamed
+            else:
+                zip_path = folder / "photos.zip"
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for p in renamed:
+                        zf.write(p, Path(p).name)
+                job["filename"] = str(zip_path)
+                job["bytes"] = zip_path.stat().st_size
+    finally:
+        if cookie_file:
+            try:
+                os.unlink(cookie_file)
+            except OSError:
+                pass
+
+
 def download_media(job_id: str, url: str, file_type: str) -> None:
     folder = STORAGE / job_id
     try:
@@ -435,7 +629,10 @@ def download_media(job_id: str, url: str, file_type: str) -> None:
             JOBS[job_id]["status"] = "processing"
         folder.mkdir(parents=True, exist_ok=True)
         if file_type == "image":
-            _download_images(job_id, url, folder)
+            if _gallery_platform(url) is not None:
+                _download_images_gallery(job_id, url, folder)
+            else:
+                _download_images(job_id, url, folder)
             return
         cmd = ytdlp_base() + [
             "--restrict-filenames", "--max-filesize", "120M",
@@ -510,7 +707,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.4"
+    server_version = "HimTik/2.0.5"
     sys_version = ""
 
     def log_message(self, fmt, *args):
@@ -553,7 +750,7 @@ class App(BaseHTTPRequestHandler):
             jid = route.rsplit("/", 1)[-1]
             with LOCK:
                 job = JOBS.get(jid)
-                payload = {k: job[k] for k in ("status", "error", "bytes") if k in job} if job else None
+                payload = {k: job[k] for k in ("status", "error", "bytes", "found", "downloaded", "warning") if k in job} if job else None
                 mode = job.get("mode") if job else None
                 image_files = list(job.get("image_files") or []) if job else []
             if payload is None:
@@ -821,8 +1018,11 @@ class App(BaseHTTPRequestHandler):
                 print(f"[timing] download stream-ready format={direct['format_id']} bytes={direct['filesize']} candidates={len(direct_list)}", flush=True)
                 return self.json_response(202, {"job_id": jid, "status": "ready",
                                                 "mode": "stream", "stream_url": "/api/stream/" + jid})
-        if file_type == "image":
+        if file_type == "image" and _gallery_platform(url) is None:
             # Pre-check: refuse video posts before downloading up to 120 MB.
+            # Instagram/Facebook skip this: yt-dlp cannot read their photo
+            # posts at all, so the gallery-dl worker does the video/login
+            # detection instead and reports it on the job.
             try:
                 info = inspect_media(url, allow_playlist=True)
             except subprocess.TimeoutExpired:

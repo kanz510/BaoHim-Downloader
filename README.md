@@ -10,6 +10,7 @@ V2 ưu tiên tốc độ: video được **truyền trực tiếp (stream)** t�
 - Dán link bài đăng công khai, xem trước tiêu đề, tác giả, thumbnail và thời lượng (nếu dữ liệu có sẵn).
 - Tải video nguồn có sẵn (ưu tiên MP4), tách MP3 bằng FFmpeg.
 - **Tải ảnh (V2.0.4):** slideshow/album ảnh và ảnh đơn từ TikTok/Instagram/Facebook. Mỗi ảnh được trả riêng (không nén zip) để mở rồi nhấn giữ lưu thẳng vào ứng dụng Ảnh trên iPhone. Tối đa 50 ảnh/album, tổng tối đa 120 MB.
+- **Tải ảnh Instagram/Facebook bằng gallery-dl (V2.0.5):** yt-dlp không đọc được bài ảnh IG ("No video formats found") và FB bắt đăng nhập, nên link IG/FB đi qua gallery-dl. Một ảnh trả thẳng file (`files: [{name, url: "/api/files/{id}/0"}]`); nhiều ảnh nén thành `photos.zip` và trả qua `download_url: "/api/files/{id}"`. Tối đa 30 ảnh/album. Job trả thêm `found` (số ảnh phát hiện), `downloaded` (số ảnh tải được) và `warning` khi tải thiếu (vd `"Chỉ tải được 3/8 ảnh."`). Không có cookie thì IG/FB thường báo lỗi rõ `"Bài này cần đăng nhập, chưa có cookie"` — muốn tải được thì đặt biến môi trường `IG_COOKIES` / `FB_COOKIES` (nội dung cookie định dạng Netscape) trong Render Dashboard; server chỉ ghi ra file tạm lúc chạy rồi xóa ngay, không in ra log, không lưu vào repo. TikTok/Douyin giữ nguyên đường yt-dlp cũ.
 - **V2 — video stream trực tiếp:** `POST /api/download` (video) trả job `ready` kèm `stream_url` ngay khi tìm được link MP4 trực tiếp; trình duyệt mở `GET /api/stream/{id}` và nhận video theo luồng, không chờ máy chủ tải xong. Stream chạy bằng yt-dlp được nạp sẵn metadata đã cache (`--load-info-json`) nên mỗi link chỉ trích xuất một lần — không thử tải trực tiếp link CDN bằng HTTP thường nữa vì TikTok chặn kiểu tải đó từ IP máy chủ. Nếu stream lỗi thì server trả `fallback: "full"` để client dùng bản tải đầy đủ (`/api/files/{id}`).
 - **V2 — cache metadata:** mỗi link chỉ chạy `yt-dlp --dump-single-json` một lần trong 10 phút; lần tải lại sau dùng cache.
 - Hàng đợi tải, trạng thái và thông báo lỗi; tệp tạm tự xóa sau khoảng 20 phút.
@@ -19,10 +20,10 @@ V2 ưu tiên tốc độ: video được **truyền trực tiếp (stream)** t�
 
 ## Chạy thử trên máy tính
 
-Cần Python 3.12+, `yt-dlp` và `ffmpeg` cài trong PATH:
+Cần Python 3.12+, `yt-dlp`, `gallery-dl` và `ffmpeg` cài trong PATH:
 
 ```sh
-python -m pip install -U yt-dlp
+python -m pip install -U yt-dlp gallery-dl
 python server.py
 ```
 
@@ -56,10 +57,12 @@ Kiểm thử mock chỉ chứng minh định tuyến và kiểm tra dữ liệu;
 
 ## Kiến trúc
 
-`public/index.html` giao diện, `public/style.css` theme, `public/app.js` xử lý fetch/polling, `server.py` HTTP server / queue / yt-dlp, `Dockerfile` cài ffmpeg và yt-dlp, `render.yaml` deploy.
+`public/index.html` giao diện, `public/style.css` theme, `public/app.js` xử lý fetch/polling, `server.py` HTTP server / queue / yt-dlp / gallery-dl, `Dockerfile` cài ffmpeg, yt-dlp và gallery-dl, `render.yaml` deploy.
 
 API: `POST /api/inspect`, `POST /api/download`, `GET /api/jobs/{id}`, `GET /api/files/{id}`, `GET /api/files/{id}/{index}`, `GET /api/stream/{id}`, `GET /api/health`.
 
 Luồng video V2: `POST /api/download {"url", "type": "video"}` → job `ready` + `stream_url` (hoặc `queued` nếu phải tải đầy đủ) → `GET /api/stream/{id}` truyền MP4 trực tiếp (`Content-Disposition: inline`, kiểm tra magic `ftyp` trước khi gửi header) → lỗi thì client gọi lại `POST /api/download {"mode": "full"}` rồi lấy `GET /api/files/{id}`. MP3 luôn đi đường tải đầy đủ.
 
 Luồng ảnh (V2.0.4): `POST /api/download {"url", "type": "image"}` → server kiểm tra trước bằng `inspect_media` (chế độ ảnh, không dùng cache): bài video thì trả 422 "Bài đăng này là video, hãy chọn loại Video."; bài ảnh thì tạo job tải đầy đủ (không stream, không zip) → `GET /api/jobs/{id}` trả `files: [{name, url: "/api/files/{id}/0", bytes}, ...]` → mỗi ảnh lấy riêng qua `GET /api/files/{id}/{index}` (`Content-Disposition: inline`, `Content-Type` theo đuôi ảnh) để mở trực tiếp rồi nhấn giữ lưu vào Ảnh. `POST /api/inspect` nhận thêm `"type": "image"` để trả trường `images` (số ảnh trong bài).
+
+Luồng ảnh Instagram/Facebook (V2.0.5, gallery-dl): `POST /api/download {"url", "type": "image"}` với link IG/FB bỏ qua bước kiểm tra yt-dlp, tạo job ngay → worker chạy gallery-dl (probe `--get-urls` đếm số ảnh, rồi tải vào thư mục tạm riêng của job; tối đa 30 ảnh; timeout probe 60s, tải 180s) → `GET /api/jobs/{id}` trả `found`, `downloaded` và `warning` (nếu tải thiếu); 1 ảnh thì trả `files: [{name, url: "/api/files/{id}/0", bytes}]`, nhiều ảnh thì trả `download_url: "/api/files/{id}"` (file `photos.zip`, `Content-Disposition: attachment`). Bài cần đăng nhập thì job báo lỗi `"Bài này cần đăng nhập, chưa có cookie"` (hoặc `"...cookie có thể đã hết hạn."` khi đã có cookie mà vẫn bị từ chối); bài video thì báo `"Bài đăng này là video, hãy chọn loại Video."`.
