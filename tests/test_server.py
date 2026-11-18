@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -672,6 +673,30 @@ class FacebookParserTests(unittest.TestCase):
                 self._parser_job(tmp, 'fbp2', 'https://www.facebook.com/photo.php?fbid=1',
                                  opener, self._cookie_file(tmp))
             self.assertIn('Không tìm thấy ảnh', str(cm.exception))
+
+    def test_parser_no_og_image_reports_page_title(self):
+        # 2.0.9: when the page has no og:image, the error names the page
+        # title so the live diagnosis can tell what Facebook served.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = b'<html><head><title>Content Not Found | Facebook</title></head></html>'
+            opener = _FakeUrlopen([page])
+            with self.assertRaises(ValueError) as cm:
+                self._parser_job(tmp, 'fbp4', 'https://www.facebook.com/photo.php?fbid=1',
+                                 opener, self._cookie_file(tmp))
+            self.assertEqual(str(cm.exception),
+                             'Không tìm thấy ảnh nào trong bài đăng này. '
+                             '(Trang: Content Not Found | Facebook)')
+
+    def test_parser_page_http_error_reports_status(self):
+        # 2.0.9: an HTTP error while fetching the page reports its status.
+        with tempfile.TemporaryDirectory() as tmp:
+            class _RaisingUrlopen:
+                def __call__(self, request, timeout=None):
+                    raise urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, None)
+            with self.assertRaises(ValueError) as cm:
+                self._parser_job(tmp, 'fbp5', 'https://www.facebook.com/photo.php?fbid=1',
+                                 _RaisingUrlopen(), self._cookie_file(tmp))
+            self.assertIn('HTTP 404', str(cm.exception))
 
     def test_parser_video_post_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
