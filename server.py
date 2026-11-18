@@ -44,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC = ROOT / "public"
@@ -577,49 +577,146 @@ _OG_VIDEO_RE = re.compile(
     r'<meta[^>]+property=["\']og:video["\']', re.IGNORECASE)
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _USER_ID_RE = re.compile(r'"USER_ID":"([^"]*)"')
-# The main photo in a logged-in Facebook page's embedded JSON (the same
-# ,"image":{"uri":"..." pattern gallery-dl's parse_photo_page uses).
-# og:image is tried first; this is the fallback when the page is a
-# logged-in JS shell without og:image (live 2.0.10: 1.1 MB page, session
-# recognised, no og:image).
-_JSON_IMAGE_RE = re.compile(r',"image":\{"uri":"([^"]+)"')
+# A Facebook CDN image URL (scontent/fbcdn host). The query string is
+# kept for the download URL; only host+path is shown in debug output.
+_FB_CDN_URL_RE = re.compile(r'https?://[A-Za-z0-9.-]*(?:scontent|fbcdn)[A-Za-z0-9.-]*\.[a-z]+/[^"\'\s\\]+')
+# Photo fbids attached to a post page (the attached photos' nodes).
+_PHOTO_FBID_RE = re.compile(r'"__typename":"Photo","id":"(\d+)"')
+# Width/height near an image URL in the page's JSON.
 _JSON_IMAGE_DIMS_RE = re.compile(r'"(width|height)":(\d+)')
+# Image URLs to skip in a Facebook page's JSON (2.0.12): profile pictures,
+# avatars, reaction/emoji/sticker images, ads and suggested content. The
+# check runs on the lowercased JSON around the URL.
+_FB_IMAGE_BLOCKLIST = ("profile_pic", "profile_picture", "avatar", "reaction",
+                       "emoji", "sticker", "sponsored", "is_ad", "advertis",
+                       "suggested")
 
 
-def _json_unescape(text: str) -> str:
-    r"""Unescape a JSON string value (\/, \\, \", \uXXXX, ...). The value is
-    only ever a URL taken from the page, never a secret."""
-    try:
-        return json.loads('"' + text + '"')
-    except (json.JSONDecodeError, ValueError):
-        return text.replace("\\/", "/")
+def _facebook_unescape(page_html: str) -> str:
+    """Unescape a Facebook page's JSON escapes (\/, \\u0026) and HTML
+    entities (&amp;) so image URLs become plain https://... links. Used
+    only for searching the page for image URLs, never returned."""
+    return html.unescape(page_html.replace("\\/", "/").replace("\\u0026", "&"))
 
 
-def _facebook_json_image_url(page_html: str) -> str | None:
-    """The main photo URL from the JSON embedded in a Facebook page's
-    <script> blocks. Prefers the largest image (by width x height in the
-    ~200 chars after the URI) when dimensions are present, else the first
-    match. Returns None when the page has no such image."""
+def _facebook_target_fbid(url: str) -> str | None:
+    """The fbid query param of a Facebook photo URL, or None (a post URL
+    has no fbid)."""
+    values = parse_qs(urlsplit(url).query).get("fbid")
+    return values[0] if values else None
+
+
+def _facebook_fbid_in(text: str, fbid: str) -> bool:
+    """Whether fbid appears in text as a standalone number (not inside a
+    longer number, so a short fbid never matches inside e.g. 1080)."""
+    return re.search(r"(?<!\d)" + re.escape(fbid) + r"(?!\d)", text) is not None
+
+
+def _facebook_best_image_url(page_html: str, target_fbid: str | None) -> str | None:
+    """The main photo URL from a Facebook page's embedded JSON. The page
+    is unescaped first (the links are escaped as \\/ and \\u0026, so a
+    plain 'https://scontent...' search finds nothing), then every
+    scontent/fbcdn image URL is scored: the URL closest to the target
+    fbid (same JSON block) wins; when no URL sits near the fbid, the
+    largest by width x height wins. Avatars, ads, reaction/emoji/
+    sticker and suggested images are skipped. Returns None when the page
+    has no usable photo URL."""
+    text = _facebook_unescape(page_html)
+    # Positions of the target fbid as a standalone number. The photo's
+    # own image URL sits in the same JSON block as its fbid, so the URL
+    # closest to an fbid occurrence is the target photo.
+    fbid_positions = []
+    if target_fbid:
+        fbid_positions = [m.start() for m in re.finditer(
+            r"(?<!\d)" + re.escape(target_fbid) + r"(?!\d)", text)]
     best_url = None
-    best_area = -1
-    for match in _JSON_IMAGE_RE.finditer(page_html):
-        url = _json_unescape(match.group(1)).strip()
-        if not url.startswith("http"):
+    best_key = None  # (fbid-nearby first, then closest, then largest)
+    for match in _FB_CDN_URL_RE.finditer(text):
+        url = match.group(0)
+        parts = urlsplit(url)
+        if "scontent" not in parts.netloc and "fbcdn" not in parts.netloc:
             continue
-        tail = page_html[match.end():match.end() + 200]
-        # Only the dims of THIS image: stop at the next image object, so a
-        # later (larger) image's dimensions never leak into this one.
-        nxt = tail.find(',"image":')
-        if nxt != -1:
-            tail = tail[:nxt]
-        dims = dict(_JSON_IMAGE_DIMS_RE.findall(tail))
+        # The blocklist runs on a tight scope — the JSON keys in the ~80
+        # chars before the URL (the image's own parent key, e.g.
+        # "profile_pic") and the object's own fields right after it. A
+        # wide window, or the raw text before the URL, would leak a
+        # blocklisted word from a neighbouring image (e.g. the previous
+        # image's filename "avatar.jpg") into this one.
+        before = text[max(0, match.start() - 80):match.start()]
+        after = text[match.end():match.end() + 200]
+        # Only the dims of THIS image: stop at the next URL, so a later
+        # (larger) image's dimensions never leak into this one.
+        nxt = re.search(r'https?://', after)
+        if nxt:
+            after = after[:nxt.start()]
+        before_keys = [k.lower() for k in re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:', before)]
+        if any(blocked in key for key in before_keys for blocked in _FB_IMAGE_BLOCKLIST):
+            continue
+        if any(blocked in after.lower() for blocked in _FB_IMAGE_BLOCKLIST):
+            continue
+        dims = dict(_JSON_IMAGE_DIMS_RE.findall(after))
         area = 0
         if "width" in dims and "height" in dims:
             area = int(dims["width"]) * int(dims["height"])
-        if area > best_area:
-            best_area = area
+        if fbid_positions:
+            dist = min(abs(match.start() - pos) for pos in fbid_positions)
+            key = (0, -dist, area) if dist <= 1000 else (1, 0, area)
+        else:
+            key = (1, 0, area)
+        if best_key is None or key > best_key:
+            best_key = key
             best_url = url
     return best_url
+
+
+def _facebook_post_photo_fbids(page_html: str) -> list[str]:
+    """Photo fbids attached to a Facebook post page (the attached photos'
+    nodes: "__typename":"Photo","id":"..."). Deduplicated, capped at
+    MAX_GALLERY_IMAGES."""
+    ids = []
+    for match in _PHOTO_FBID_RE.finditer(page_html):
+        if match.group(1) not in ids:
+            ids.append(match.group(1))
+    return ids[:MAX_GALLERY_IMAGES]
+
+
+def _facebook_debug_info(page_html: str, target_fbid: str | None) -> str:
+    """Debug info for a Facebook parser failure. Only included when the
+    HIMTIK_FB_DEBUG env var is set. Never includes cookie values or raw
+    HTML — only scontent counts (raw vs unescaped), up to 10 image-link
+    samples (the JSON key right before each link, host+path with the
+    query string stripped, nearby dimensions), and whether the target
+    fbid is in the page."""
+    raw_count = page_html.count("scontent")
+    text = _facebook_unescape(page_html)
+    unesc_count = text.count("scontent")
+    samples = []
+    for match in _FB_CDN_URL_RE.finditer(text):
+        if len(samples) >= 10:
+            break
+        url = match.group(0)
+        parts = urlsplit(url)
+        host_path = parts.netloc + parts.path
+        before = text[max(0, match.start() - 120):match.start()]
+        key_match = re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:', before)
+        key = key_match[-1] if key_match else "?"
+        after = text[match.end():match.end() + 200]
+        nxt = re.search(r'https?://', after)
+        if nxt:
+            after = after[:nxt.start()]
+        dims = dict(_JSON_IMAGE_DIMS_RE.findall(after))
+        dim_text = ""
+        if "width" in dims and "height" in dims:
+            dim_text = f" {dims['width']}x{dims['height']}"
+        samples.append(f"{key}: {host_path}{dim_text}")
+    if target_fbid:
+        fbid_text = f"fbid {'có' if _facebook_fbid_in(text, target_fbid) else 'không'} trong trang"
+    else:
+        fbid_text = "không có fbid đích"
+    return (
+        f"[Debug: scontent trong HTML thô: {raw_count}, sau unescape: {unesc_count}; "
+        f"{fbid_text}; mẫu ({len(samples)}): " + "; ".join(samples) + "]"
+    )
 
 
 def _cookie_value(header: str, name: str) -> str | None:
@@ -762,18 +859,10 @@ def _netscape_cookie_header(cookie_file: str, url: str) -> str:
     return "; ".join(pairs)
 
 
-def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
-                                     cookie_file: str) -> None:
-    """Facebook photo fallback: fetch the post page with the FB cookies
-    and take its og:image. gallery-dl's Facebook extractor cannot parse
-    some photo pages (it crashes, e.g. KeyError 'fbid'), so this bypasses
-    it. Only ever returns one image (the page's main photo); video posts
-    are rejected instead of returning a thumbnail. Raises ValueError
-    (user-facing message) on any failure."""
-    headers = dict(FB_PARSER_HEADERS)
-    cookie_header = _netscape_cookie_header(cookie_file, url)
-    if cookie_header:
-        headers["Cookie"] = cookie_header
+def _fetch_facebook_page(url: str, headers: dict, cookie_header: str):
+    """Fetch one Facebook page with the parser headers and cookies.
+    Returns (page, final_url, status, raw_len). Raises ValueError (with
+    the diagnostic line) on any failure."""
     page_request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(page_request, timeout=FB_PARSER_PAGE_TIMEOUT) as resp:
@@ -793,20 +882,13 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
     except (urllib.error.URLError, OSError):
         diag = _facebook_diagnostic(url, 0, 0, cookie_header, "")
         raise ValueError(f"Không đọc được bài đăng. Hãy thử liên kết công khai khác. {diag}")
-    if _OG_VIDEO_RE.search(page):
-        raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
-    image_url = _facebook_og_image_url(page)
-    if not image_url:
-        # A logged-in page is often a JS shell without og:image; the photo
-        # URL is then in the JSON embedded in <script> blocks (2.0.11).
-        image_url = _facebook_json_image_url(page)
-    if not image_url:
-        if _gallery_login_required(page):
-            raise ValueError(_gallery_login_error(cookie_file))
-        title = _page_title(page)
-        detail = f" (Trang: {title})" if title else ""
-        diag = _facebook_diagnostic(final_url, status, len(raw), cookie_header, page)
-        raise ValueError(f"Không tìm thấy ảnh nào trong bài đăng này.{detail} {diag}")
+    return page, final_url, status, len(raw)
+
+
+def _fetch_facebook_image(image_url: str, headers: dict) -> tuple[bytes, str]:
+    """Download one Facebook image URL. Returns (data, ext). Raises
+    ValueError when the download fails, the file is too big, or the
+    content is not an image."""
     image_request = urllib.request.Request(image_url, headers=headers)
     try:
         with urllib.request.urlopen(image_request, timeout=FB_PARSER_IMAGE_TIMEOUT) as resp:
@@ -818,11 +900,93 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
     ext = _image_ext_from_url_or_bytes(image_url, data[:12])
     if not is_image_bytes(data[:12], ext):
         raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
-    target = folder / f"01{ext}"
-    target.write_bytes(data)
+    return data, ext
+
+
+def _raise_facebook_no_image(page: str, final_url: str, status: int, raw_len: int,
+                             cookie_header: str, cookie_file: str | None,
+                             target_fbid: str | None) -> None:
+    """Raise the 'no photo found' error for a Facebook page. Includes the
+    page title and the diagnostic line; when HIMTIK_FB_DEBUG is set, also
+    the debug line (counts and samples only — never cookie values or raw
+    HTML)."""
+    if _gallery_login_required(page):
+        raise ValueError(_gallery_login_error(cookie_file))
+    title = _page_title(page)
+    detail = f" (Trang: {title})" if title else ""
+    diag = _facebook_diagnostic(final_url, status, raw_len, cookie_header, page)
+    debug = ""
+    if os.environ.get("HIMTIK_FB_DEBUG"):
+        debug = " " + _facebook_debug_info(page, target_fbid)
+    raise ValueError(f"Không tìm thấy ảnh nào trong bài đăng này.{detail} {diag}{debug}")
+
+
+def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
+                                     cookie_file: str) -> None:
+    """Facebook photo fallback: fetch the post page with the FB cookies
+    and take its photo(s). gallery-dl's Facebook extractor cannot parse
+    some photo pages (it crashes, e.g. KeyError 'fbid'), so this bypasses
+    it. A photo URL (fbid=...) returns its single photo; a post URL
+    (/posts/...) fetches each attached photo's own page for the original.
+    Video posts are rejected instead of returning a thumbnail. Raises
+    ValueError (user-facing message) on any failure."""
+    headers = dict(FB_PARSER_HEADERS)
+    cookie_header = _netscape_cookie_header(cookie_file, url)
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    target_fbid = _facebook_target_fbid(url)
+    page, final_url, status, raw_len = _fetch_facebook_page(url, headers, cookie_header)
+    if _OG_VIDEO_RE.search(page):
+        raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
+    if target_fbid:
+        image_url = _facebook_og_image_url(page) or _facebook_best_image_url(page, target_fbid)
+        if not image_url:
+            _raise_facebook_no_image(page, final_url, status, raw_len,
+                                     cookie_header, cookie_file, target_fbid)
+        data, ext = _fetch_facebook_image(image_url, headers)
+        target = folder / f"01{ext}"
+        target.write_bytes(data)
+        with LOCK:
+            JOBS[job_id].update(status="ready", bytes=len(data), found=1, downloaded=1,
+                                image_files=[str(target)])
+        return
+    # A post URL: collect the attached photos' fbids, then fetch each
+    # photo's own page for the original image.
+    fbids = _facebook_post_photo_fbids(page)
+    if not fbids:
+        _raise_facebook_no_image(page, final_url, status, raw_len,
+                                 cookie_header, cookie_file, None)
+    image_files = []
+    total_bytes = 0
+    for index, fbid in enumerate(fbids, start=1):
+        photo_url = f"https://www.facebook.com/photo.php?fbid={fbid}"
+        try:
+            photo_page, _, _, _ = _fetch_facebook_page(photo_url, headers, cookie_header)
+        except ValueError:
+            continue
+        if _OG_VIDEO_RE.search(photo_page):
+            continue
+        image_url = (_facebook_og_image_url(photo_page)
+                     or _facebook_best_image_url(photo_page, fbid))
+        if not image_url:
+            continue
+        try:
+            data, ext = _fetch_facebook_image(image_url, headers)
+        except ValueError:
+            continue
+        target = folder / f"{index:02d}{ext}"
+        target.write_bytes(data)
+        image_files.append(str(target))
+        total_bytes += len(data)
+    if not image_files:
+        _raise_facebook_no_image(page, final_url, status, raw_len,
+                                 cookie_header, cookie_file, None)
     with LOCK:
-        JOBS[job_id].update(status="ready", bytes=len(data), found=1, downloaded=1,
-                            image_files=[str(target)])
+        job = JOBS[job_id]
+        job.update(status="ready", bytes=total_bytes, found=len(fbids),
+                   downloaded=len(image_files), image_files=image_files)
+        if len(image_files) < len(fbids):
+            job["warning"] = f"Chỉ tải được {len(image_files)}/{len(fbids)} ảnh."
 
 
 def _download_images_gallery(job_id: str, url: str, folder: Path) -> None:
@@ -1005,7 +1169,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.11"
+    server_version = "HimTik/2.0.12"
     sys_version = ""
 
     def log_message(self, fmt, *args):
