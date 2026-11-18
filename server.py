@@ -25,7 +25,6 @@ Audio (MP3) always uses the full-download path.
 from __future__ import annotations
 
 import html
-import http.cookiejar
 import ipaddress
 import json
 import mimetypes
@@ -596,6 +595,46 @@ def _image_ext_from_url_or_bytes(url: str, head: bytes) -> str:
     return ".jpg"
 
 
+def _netscape_cookie_header(cookie_file: str, url: str) -> str:
+    """Build a Cookie header from a Netscape-format cookie file, leniently.
+
+    Cookie-Editor exports leading-dot domains (".facebook.com") with the
+    domain flag FALSE; CPython's MozillaCookieJar asserts the two agree and
+    refuses the whole file (LoadError), so the file is read by hand and
+    bad lines are skipped instead of failing. Only cookies matching the
+    request host and path are sent. Returns "" when nothing usable is found.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    path = urlsplit(url).path or "/"
+    try:
+        with open(cookie_file, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return ""
+    pairs = []
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7:
+            fields = line.split()
+        if len(fields) != 7:
+            continue
+        domain, _flag, cookie_path, _secure, _expires, name, value = fields
+        domain = domain.lower().lstrip(".")
+        if not (host == domain or host.endswith("." + domain)):
+            continue
+        if not path.startswith(cookie_path):
+            continue
+        if not name or "=" in name:
+            continue
+        pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
 def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
                                      cookie_file: str) -> None:
     """Facebook photo fallback: fetch the post page with the FB cookies
@@ -604,15 +643,13 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
     it. Only ever returns one image (the page's main photo); video posts
     are rejected instead of returning a thumbnail. Raises ValueError
     (user-facing message) on any failure."""
-    jar = http.cookiejar.MozillaCookieJar(cookie_file)
+    headers = dict(FB_PARSER_HEADERS)
+    cookie_header = _netscape_cookie_header(cookie_file, url)
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    page_request = urllib.request.Request(url, headers=headers)
     try:
-        jar.load(ignore_discard=True, ignore_expires=True)
-    except OSError:
-        raise ValueError("Không đọc được cookie Facebook.")
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    page_request = urllib.request.Request(url, headers=FB_PARSER_HEADERS)
-    try:
-        with opener.open(page_request, timeout=FB_PARSER_PAGE_TIMEOUT) as resp:
+        with urllib.request.urlopen(page_request, timeout=FB_PARSER_PAGE_TIMEOUT) as resp:
             page = resp.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError):
         raise ValueError("Không đọc được bài đăng. Hãy thử liên kết công khai khác.")
@@ -623,9 +660,9 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
         if _gallery_login_required(page):
             raise ValueError(_gallery_login_error(cookie_file))
         raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
-    image_request = urllib.request.Request(image_url, headers=FB_PARSER_HEADERS)
+    image_request = urllib.request.Request(image_url, headers=headers)
     try:
-        with opener.open(image_request, timeout=FB_PARSER_IMAGE_TIMEOUT) as resp:
+        with urllib.request.urlopen(image_request, timeout=FB_PARSER_IMAGE_TIMEOUT) as resp:
             data = resp.read(MAX_BYTES + 1)
     except (urllib.error.URLError, OSError):
         raise ValueError("Không tải được ảnh từ bài đăng này.")
@@ -821,7 +858,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.7"
+    server_version = "HimTik/2.0.8"
     sys_version = ""
 
     def log_message(self, fmt, *args):
