@@ -959,6 +959,55 @@ class FacebookParserTests(unittest.TestCase):
                                  opener, self._cookie_file(tmp))
             self.assertIn('video', str(cm.exception))
 
+    def test_gallery_verbose_log_redacts_cookies(self):
+        # 2.0.13 (HAND OFF 3 step 1): the gallery-dl -v log never includes
+        # cookie values — any line mentioning cookies is dropped.
+        fake_stderr = ('[gallery-dl][debug] Version 1.32.20\n'
+                       '[facebook][debug] cookies: Loading cookies from \'/tmp/x.txt\'\n'
+                       '[urllib3.connectionpool][debug] https://www.facebook.com:443 '
+                       '"GET /photo/?fbid=1 HTTP/1.1" 302 0\n'
+                       '[facebook][error] AuthRequired: You must be logged in.\n')
+        with patch('server.subprocess.run') as run:
+            run.return_value = type('Result', (), {'returncode': 1, 'stdout': '',
+                                                   'stderr': fake_stderr})()
+            log = server._gallery_verbose_log('https://www.facebook.com/photo.php?fbid=1', '/tmp/x.txt')
+        self.assertIn('Version 1.32.20', log)
+        self.assertIn('GET /photo/?fbid=1', log)
+        self.assertIn('AuthRequired', log)
+        self.assertNotIn('cookie', log.lower())
+        # The verbose command itself carries -v.
+        args = run.call_args[0][0]
+        self.assertIn('-v', args)
+        self.assertIn('--get-urls', args)
+
+    def test_facebook_fallback_appends_gallery_verbose_log(self):
+        # 2.0.13: when the gallery probe fails and the parser also fails,
+        # the final error carries the sanitised gallery-dl -v log (debug
+        # mode only), with cookie values removed.
+        def simulate(command, **kwargs):
+            if '-v' in command:
+                return type('Result', (), {'returncode': 1, 'stdout': '',
+                                           'stderr': '[facebook][debug] cookies: Loading cookies\n'
+                                                     '[facebook][error] AuthRequired: login needed.\n'})()
+            if '--get-urls' in command:
+                return type('Result', (), {'returncode': 1, 'stdout': '', 'stderr': ''})()
+            return type('Result', (), {'returncode': 1, 'stdout': '', 'stderr': ''})()
+        with tempfile.TemporaryDirectory() as tmp:
+            page = b'<html><head><title>Facebook</title></head><body>no photo</body></html>'
+            opener = _FakeUrlopen([page])
+            job = self._fallback_job(tmp, 'fbv1', 'https://www.facebook.com/photo.php?fbid=1',
+                                     simulate, opener,
+                                     {'FB_COOKIES': self.FB_COOKIE_TEXT,
+                                      'HIMTIK_FB_DEBUG': '1'})
+            self.assertEqual(job['status'], 'error')
+            self.assertIn('[gallery-dl -v:', job['error'])
+            self.assertIn('AuthRequired', job['error'])
+            # The -v "Loading cookies" line is dropped; the cookie value
+            # never appears. (The diagnostic line legitimately names the
+            # cookies present — c_user/xs — without their values.)
+            self.assertNotIn('Loading cookies', job['error'])
+            self.assertNotIn('123', job['error'])
+
     def _fallback_job(self, tmp, jid, url, simulate, opener, env):
         with server.LOCK:
             server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
