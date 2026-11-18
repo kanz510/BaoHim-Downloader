@@ -74,12 +74,18 @@ FB_PARSER_IMAGE_TIMEOUT = 60
 FB_PARSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 # Facebook serves a stripped page to bare requests, so the parser sends
-# browser-like headers (2.0.7).
+# browser-like headers (2.0.7). The Sec-Fetch headers are what gallery-dl's
+# Facebook extractor sends too (2.0.11): without them Facebook answers
+# HTTP 400 to some URLs (verified locally: /posts/ went 400 -> 200 once
+# Sec-Fetch-Dest/Mode/Site were added).
 FB_PARSER_HEADERS = {
     "User-Agent": FB_PARSER_UA,
     "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-               "image/avif,image/webp,*/*;q=0.8"),
+               "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8"),
     "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
 }
 # Gallery errors that must NOT fall back to the Facebook parser: a login
 # failure (the parser needs a session too), the 30-image cap, the 120 MB
@@ -571,6 +577,49 @@ _OG_VIDEO_RE = re.compile(
     r'<meta[^>]+property=["\']og:video["\']', re.IGNORECASE)
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _USER_ID_RE = re.compile(r'"USER_ID":"([^"]*)"')
+# The main photo in a logged-in Facebook page's embedded JSON (the same
+# ,"image":{"uri":"..." pattern gallery-dl's parse_photo_page uses).
+# og:image is tried first; this is the fallback when the page is a
+# logged-in JS shell without og:image (live 2.0.10: 1.1 MB page, session
+# recognised, no og:image).
+_JSON_IMAGE_RE = re.compile(r',"image":\{"uri":"([^"]+)"')
+_JSON_IMAGE_DIMS_RE = re.compile(r'"(width|height)":(\d+)')
+
+
+def _json_unescape(text: str) -> str:
+    r"""Unescape a JSON string value (\/, \\, \", \uXXXX, ...). The value is
+    only ever a URL taken from the page, never a secret."""
+    try:
+        return json.loads('"' + text + '"')
+    except (json.JSONDecodeError, ValueError):
+        return text.replace("\\/", "/")
+
+
+def _facebook_json_image_url(page_html: str) -> str | None:
+    """The main photo URL from the JSON embedded in a Facebook page's
+    <script> blocks. Prefers the largest image (by width x height in the
+    ~200 chars after the URI) when dimensions are present, else the first
+    match. Returns None when the page has no such image."""
+    best_url = None
+    best_area = -1
+    for match in _JSON_IMAGE_RE.finditer(page_html):
+        url = _json_unescape(match.group(1)).strip()
+        if not url.startswith("http"):
+            continue
+        tail = page_html[match.end():match.end() + 200]
+        # Only the dims of THIS image: stop at the next image object, so a
+        # later (larger) image's dimensions never leak into this one.
+        nxt = tail.find(',"image":')
+        if nxt != -1:
+            tail = tail[:nxt]
+        dims = dict(_JSON_IMAGE_DIMS_RE.findall(tail))
+        area = 0
+        if "width" in dims and "height" in dims:
+            area = int(dims["width"]) * int(dims["height"])
+        if area > best_area:
+            best_area = area
+            best_url = url
+    return best_url
 
 
 def _cookie_value(header: str, name: str) -> str | None:
@@ -747,6 +796,10 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
     if _OG_VIDEO_RE.search(page):
         raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
     image_url = _facebook_og_image_url(page)
+    if not image_url:
+        # A logged-in page is often a JS shell without og:image; the photo
+        # URL is then in the JSON embedded in <script> blocks (2.0.11).
+        image_url = _facebook_json_image_url(page)
     if not image_url:
         if _gallery_login_required(page):
             raise ValueError(_gallery_login_error(cookie_file))
@@ -952,7 +1005,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.10"
+    server_version = "HimTik/2.0.11"
     sys_version = ""
 
     def log_message(self, fmt, *args):
