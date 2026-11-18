@@ -7,7 +7,10 @@ yt-dlp cannot read them (IG photo posts report "No video formats found",
 FB requires a login). gallery-dl runs without cookies by default; optional
 IG_COOKIES / FB_COOKIES env vars (Netscape format) are written to a temp
 file at runtime and passed with --cookies, never logged or stored in the
-repo. One image is served as a single file; several are zipped.
+repo. Every image is served as an individual file (no zip), so the iPhone
+Shortcut can save each straight into Photos. For Facebook, when gallery-dl
+cannot parse the photo page, the server falls back to fetching the page
+with the FB cookies and taking its og:image.
 
 V2: video downloads prefer direct streaming. POST /api/download first resolves the
 post's direct MP4 URL (cached metadata) and returns a ready stream job; the client
@@ -21,6 +24,8 @@ Audio (MP3) always uses the full-download path.
 """
 from __future__ import annotations
 
+import html
+import http.cookiejar
 import ipaddress
 import json
 import mimetypes
@@ -36,7 +41,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +67,18 @@ _GALLERY_LOGIN_MARKERS = (
     "login required", "not logged in", "authentication required",
     "log in to continue",
 )
+# Facebook og:image parser fallback (2.0.6): gallery-dl's Facebook
+# extractor cannot parse some photo pages (it crashes, e.g. KeyError
+# 'fbid'). Fetch the page with the FB cookies and take the og:image.
+FB_PARSER_PAGE_TIMEOUT = 30
+FB_PARSER_IMAGE_TIMEOUT = 60
+FB_PARSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+# Gallery errors that must NOT fall back to the Facebook parser: a login
+# failure (the parser needs a session too), the 30-image cap, the 120 MB
+# cap, and video posts (the parser would return a video thumbnail).
+_FB_PARSER_SKIP_PREFIXES = ("Bài này cần đăng nhập", "Album quá nhiều ảnh",
+                            "Tổng dung lượng", "Bài đăng này là video")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp")
 IMAGE_CONTENT_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                        ".webp": "image/webp", ".gif": "image/gif",
@@ -535,85 +551,169 @@ def _gallery_probe(url: str, cookie_file: str | None) -> int:
     return len(urls)
 
 
+_OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+    re.IGNORECASE)
+_OG_IMAGE_RE_REV = re.compile(
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+    re.IGNORECASE)
+_OG_VIDEO_RE = re.compile(
+    r'<meta[^>]+property=["\']og:video["\']', re.IGNORECASE)
+
+
+def _facebook_og_image_url(page_html: str) -> str | None:
+    """The og:image URL of a Facebook photo page, or None when absent."""
+    for pattern in (_OG_IMAGE_RE, _OG_IMAGE_RE_REV):
+        match = pattern.search(page_html)
+        if match:
+            url = html.unescape(match.group(1)).strip()
+            if url.startswith("http"):
+                return url
+    return None
+
+
+def _image_ext_from_url_or_bytes(url: str, head: bytes) -> str:
+    """File extension for a downloaded image: the URL suffix first,
+    otherwise sniff the magic bytes."""
+    ext = Path(urlsplit(url).path).suffix.lower()
+    if ext in IMAGE_EXTENSIONS and is_image_bytes(head, ext):
+        return ext
+    for candidate in (".jpg", ".png", ".webp", ".gif", ".bmp", ".avif"):
+        if is_image_bytes(head, candidate):
+            return candidate
+    return ".jpg"
+
+
+def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
+                                     cookie_file: str) -> None:
+    """Facebook photo fallback: fetch the post page with the FB cookies
+    and take its og:image. gallery-dl's Facebook extractor cannot parse
+    some photo pages (it crashes, e.g. KeyError 'fbid'), so this bypasses
+    it. Only ever returns one image (the page's main photo); video posts
+    are rejected instead of returning a thumbnail. Raises ValueError
+    (user-facing message) on any failure."""
+    jar = http.cookiejar.MozillaCookieJar(cookie_file)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except OSError:
+        raise ValueError("Không đọc được cookie Facebook.")
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    page_request = urllib.request.Request(url, headers={"User-Agent": FB_PARSER_UA})
+    try:
+        with opener.open(page_request, timeout=FB_PARSER_PAGE_TIMEOUT) as resp:
+            page = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError):
+        raise ValueError("Không đọc được bài đăng. Hãy thử liên kết công khai khác.")
+    if _OG_VIDEO_RE.search(page):
+        raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
+    image_url = _facebook_og_image_url(page)
+    if not image_url:
+        raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+    image_request = urllib.request.Request(image_url, headers={"User-Agent": FB_PARSER_UA})
+    try:
+        with opener.open(image_request, timeout=FB_PARSER_IMAGE_TIMEOUT) as resp:
+            data = resp.read(MAX_BYTES + 1)
+    except (urllib.error.URLError, OSError):
+        raise ValueError("Không tải được ảnh từ bài đăng này.")
+    if not data or len(data) > MAX_BYTES:
+        raise ValueError("Tổng dung lượng ảnh vượt 120 MB.")
+    ext = _image_ext_from_url_or_bytes(image_url, data[:12])
+    if not is_image_bytes(data[:12], ext):
+        raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+    target = folder / f"01{ext}"
+    target.write_bytes(data)
+    with LOCK:
+        JOBS[job_id].update(status="ready", bytes=len(data), found=1, downloaded=1,
+                            image_files=[str(target)])
+
+
 def _download_images_gallery(job_id: str, url: str, folder: Path) -> None:
     """Instagram/Facebook photo posts via gallery-dl.
 
     Probe first for the found count, then download into the job folder.
-    One image is served as a single file (same as the yt-dlp path); several
-    are zipped into photos.zip and served through /api/files/<job>.
-    A partial download is still returned, with found/downloaded/warning on
-    the job. Raises ValueError (caught by download_media) on any failure.
+    Every image is served as an individual file (no zip), so the iPhone
+    Shortcut can save each straight into Photos. A partial download is
+    still returned, with found/downloaded/warning on the job.
+    For Facebook, when gallery-dl cannot parse the photo page, the server
+    falls back to the og:image parser using the FB cookies.
+    Raises ValueError (caught by download_media) on any failure.
     """
     platform = _gallery_platform(url) or "instagram"
     cookie_file = _gallery_cookie_file(platform)
     try:
-        found = _gallery_probe(url, cookie_file)
-        if found > MAX_GALLERY_IMAGES:
-            raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_GALLERY_IMAGES} ảnh).")
-        cmd = _gallery_cmd(cookie_file) + ["-d", str(folder), url]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    timeout=GALLERY_DOWNLOAD_TIMEOUT, check=False)
-        except subprocess.TimeoutExpired:
-            raise ValueError("Quá thời gian xử lý. Hãy thử album ít ảnh hơn.")
-        except OSError:
-            raise ValueError("Máy chủ chưa cài gallery-dl.")
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
-        if _gallery_login_required(output):
-            raise ValueError(_gallery_login_error(cookie_file))
-        if result.returncode != 0:
-            raise ValueError("Không tải được ảnh từ bài đăng này.")
-        # gallery-dl writes into extractor subfolders; collect recursively.
-        found_files = [p for p in sorted(folder.rglob("*")) if p.is_file()]
-        images = [p for p in found_files if p.suffix.lower() in IMAGE_EXTENSIONS]
-        valid = []
-        for p in images:
-            with p.open("rb") as probe:
-                head = probe.read(12)
-            if is_image_bytes(head, p.suffix.lower()):
-                valid.append(p)
-        if not valid:
-            video_exts = (".mp4", ".mkv", ".webm", ".mov")
-            if any(p.suffix.lower() in video_exts for p in found_files):
-                raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
-            raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
-        downloaded = len(valid)
-        if downloaded > MAX_GALLERY_IMAGES:
-            # The probe already capped this; a post can gain items between
-            # probe and download, so check again here.
-            raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_GALLERY_IMAGES} ảnh).")
-        total = sum(p.stat().st_size for p in valid)
-        if not 0 < total <= MAX_BYTES:
-            raise ValueError("Tổng dung lượng ảnh vượt 120 MB.")
-        # Flatten to 01.<ext>, 02.<ext>, ... in post order. Two-phase
-        # rename: a file may already carry a target name.
-        staged = []
-        for i, p in enumerate(valid, 1):
-            temp = folder / f".g{i:02d}{p.suffix.lower()}"
-            p.rename(temp)
-            staged.append(temp)
-        renamed = []
-        for i, temp in enumerate(staged, 1):
-            target = folder / f"{i:02d}{temp.suffix.lower()}"
-            temp.rename(target)
-            renamed.append(str(target))
-        warning = ""
-        if downloaded < found:
-            warning = f"Chỉ tải được {downloaded}/{found} ảnh."
-        with LOCK:
-            job = JOBS[job_id]
-            job.update(status="ready", bytes=total, found=found, downloaded=downloaded)
-            if warning:
-                job["warning"] = warning
-            if len(renamed) == 1:
+            found = _gallery_probe(url, cookie_file)
+            if found > MAX_GALLERY_IMAGES:
+                raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_GALLERY_IMAGES} ảnh).")
+            cmd = _gallery_cmd(cookie_file) + ["-d", str(folder), url]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=GALLERY_DOWNLOAD_TIMEOUT, check=False)
+            except subprocess.TimeoutExpired:
+                raise ValueError("Quá thời gian xử lý. Hãy thử album ít ảnh hơn.")
+            except OSError:
+                raise ValueError("Máy chủ chưa cài gallery-dl.")
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            if _gallery_login_required(output):
+                raise ValueError(_gallery_login_error(cookie_file))
+            if result.returncode != 0:
+                raise ValueError("Không tải được ảnh từ bài đăng này.")
+            # gallery-dl writes into extractor subfolders; collect recursively.
+            found_files = [p for p in sorted(folder.rglob("*")) if p.is_file()]
+            images = [p for p in found_files if p.suffix.lower() in IMAGE_EXTENSIONS]
+            valid = []
+            for p in images:
+                with p.open("rb") as probe:
+                    head = probe.read(12)
+                if is_image_bytes(head, p.suffix.lower()):
+                    valid.append(p)
+            if not valid:
+                video_exts = (".mp4", ".mkv", ".webm", ".mov")
+                if any(p.suffix.lower() in video_exts for p in found_files):
+                    raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
+                raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+            downloaded = len(valid)
+            if downloaded > MAX_GALLERY_IMAGES:
+                # The probe already capped this; a post can gain items between
+                # probe and download, so check again here.
+                raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_GALLERY_IMAGES} ảnh).")
+            total = sum(p.stat().st_size for p in valid)
+            if not 0 < total <= MAX_BYTES:
+                raise ValueError("Tổng dung lượng ảnh vượt 120 MB.")
+            # Flatten to 01.<ext>, 02.<ext>, ... in post order. Two-phase
+            # rename: a file may already carry a target name.
+            staged = []
+            for i, p in enumerate(valid, 1):
+                temp = folder / f".g{i:02d}{p.suffix.lower()}"
+                p.rename(temp)
+                staged.append(temp)
+            renamed = []
+            for i, temp in enumerate(staged, 1):
+                target = folder / f"{i:02d}{temp.suffix.lower()}"
+                temp.rename(target)
+                renamed.append(str(target))
+            warning = ""
+            if downloaded < found:
+                warning = f"Chỉ tải được {downloaded}/{found} ảnh."
+            with LOCK:
+                job = JOBS[job_id]
+                job.update(status="ready", bytes=total, found=found, downloaded=downloaded)
+                if warning:
+                    job["warning"] = warning
                 job["image_files"] = renamed
-            else:
-                zip_path = folder / "photos.zip"
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for p in renamed:
-                        zf.write(p, Path(p).name)
-                job["filename"] = str(zip_path)
-                job["bytes"] = zip_path.stat().st_size
+        except ValueError as exc:
+            # Facebook fallback: gallery-dl's extractor cannot parse some
+            # photo pages. Try the og:image parser when FB cookies are
+            # configured; login/cap/size/video failures are re-raised as-is.
+            message = str(exc)
+            if (platform == "facebook" and cookie_file
+                    and not message.startswith(_FB_PARSER_SKIP_PREFIXES)):
+                try:
+                    _download_images_facebook_parser(job_id, url, folder, cookie_file)
+                except ValueError:
+                    raise exc
+                return
+            raise
     finally:
         if cookie_file:
             try:
@@ -707,7 +807,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.5"
+    server_version = "HimTik/2.0.6"
     sys_version = ""
 
     def log_message(self, fmt, *args):
