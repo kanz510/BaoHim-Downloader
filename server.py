@@ -570,6 +570,73 @@ _OG_IMAGE_SECURE_RE = re.compile(
 _OG_VIDEO_RE = re.compile(
     r'<meta[^>]+property=["\']og:video["\']', re.IGNORECASE)
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_USER_ID_RE = re.compile(r'"USER_ID":"([^"]*)"')
+
+
+def _cookie_value(header: str, name: str) -> str | None:
+    """One cookie's value from a Cookie header, or None. The value is only
+    ever used for an in-memory comparison and is never returned in a
+    diagnostic or an error message."""
+    for part in header.split(";"):
+        part = part.strip()
+        if part.startswith(name + "="):
+            return part[len(name) + 1:]
+    return None
+
+
+def _cookie_header_info(header: str) -> dict:
+    """Names, duplicates, c_user/xs presence and length of a Cookie header.
+    Cookie values are never returned."""
+    names = []
+    for part in header.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        names.append(part.split("=", 1)[0])
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    return {
+        "names": names,
+        "duplicates": duplicates,
+        "has_c_user": "c_user" in names,
+        "has_xs": "xs" in names,
+        "length": len(header),
+    }
+
+
+def _user_id_info(page_html: str, c_user_value: str | None) -> tuple[bool, bool]:
+    """(has_user_id, matches_c_user) for a Facebook page. A logged-out
+    page has no USER_ID field at all (verified 2026-11-19: the logged-out
+    error/login pages contain zero USER_ID occurrences), so absence means
+    the page is a shell/error page, not a real logged-in app page. The
+    c_user value is compared in memory only and never reported."""
+    match = _USER_ID_RE.search(page_html)
+    if not match:
+        return False, False
+    if c_user_value is None:
+        return True, False
+    return True, match.group(1) == c_user_value
+
+
+def _facebook_diagnostic(final_url: str, status: int, body_len: int,
+                         cookie_header: str, page_html: str) -> str:
+    """One-line diagnostic for a Facebook parser failure. Never includes
+    cookie values or page content — only the final URL path (after
+    redirects), the HTTP status, the body length, the cookie names sent
+    (c_user/xs presence, duplicates, header length), and USER_ID presence
+    plus whether it matches c_user (true/false only)."""
+    info = _cookie_header_info(cookie_header)
+    has_uid, uid_matches = _user_id_info(page_html, _cookie_value(cookie_header, "c_user"))
+    final_path = urlsplit(final_url).path or "/"
+    status_text = str(status) if status else "không có phản hồi"
+    return (
+        f"[Chẩn đoán: URL cuối: {final_path}, HTTP {status_text}, "
+        f"body {body_len} B, cookie: {'c_user có' if info['has_c_user'] else 'c_user không'}, "
+        f"{'xs có' if info['has_xs'] else 'xs không'}, "
+        f"tên: {', '.join(info['names']) or 'không có'}, "
+        f"trùng: {', '.join(info['duplicates']) or 'không'}, "
+        f"dài {info['length']} ký tự, "
+        f"USER_ID: {'có' if has_uid else 'không'}, khớp c_user: {'đúng' if uid_matches else 'sai'}]"
+    )
 
 
 def _page_title(page_html: str) -> str:
@@ -661,11 +728,22 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
     page_request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(page_request, timeout=FB_PARSER_PAGE_TIMEOUT) as resp:
-            page = resp.read().decode("utf-8", "replace")
+            final_url = resp.geturl()
+            status = resp.status
+            raw = resp.read()
+            page = raw.decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        raise ValueError(f"Không đọc được bài đăng (HTTP {exc.code}). Hãy thử liên kết công khai khác.")
+        try:
+            err_raw = exc.read()
+        except Exception:
+            err_raw = b""
+        err_page = err_raw.decode("utf-8", "replace")
+        diag = _facebook_diagnostic(exc.geturl(), exc.code, len(err_raw),
+                                    cookie_header, err_page)
+        raise ValueError(f"Không đọc được bài đăng (HTTP {exc.code}). Hãy thử liên kết công khai khác. {diag}")
     except (urllib.error.URLError, OSError):
-        raise ValueError("Không đọc được bài đăng. Hãy thử liên kết công khai khác.")
+        diag = _facebook_diagnostic(url, 0, 0, cookie_header, "")
+        raise ValueError(f"Không đọc được bài đăng. Hãy thử liên kết công khai khác. {diag}")
     if _OG_VIDEO_RE.search(page):
         raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
     image_url = _facebook_og_image_url(page)
@@ -674,7 +752,8 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
             raise ValueError(_gallery_login_error(cookie_file))
         title = _page_title(page)
         detail = f" (Trang: {title})" if title else ""
-        raise ValueError(f"Không tìm thấy ảnh nào trong bài đăng này.{detail}")
+        diag = _facebook_diagnostic(final_url, status, len(raw), cookie_header, page)
+        raise ValueError(f"Không tìm thấy ảnh nào trong bài đăng này.{detail} {diag}")
     image_request = urllib.request.Request(image_url, headers=headers)
     try:
         with urllib.request.urlopen(image_request, timeout=FB_PARSER_IMAGE_TIMEOUT) as resp:
@@ -873,7 +952,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.9"
+    server_version = "HimTik/2.0.10"
     sys_version = ""
 
     def log_message(self, fmt, *args):
