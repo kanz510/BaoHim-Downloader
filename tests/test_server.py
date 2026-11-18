@@ -767,35 +767,82 @@ class FacebookParserTests(unittest.TestCase):
             self.assertIn('khớp c_user: đúng', msg)
             self.assertNotIn('123', msg)
 
-    def test_json_unescape(self):
-        # 2.0.11: JSON-escaped URLs (\/, \uXXXX) are restored.
-        self.assertEqual(server._json_unescape('https:\\/\\/scontent.example.com\\/a.jpg'),
+    def test_facebook_unescape(self):
+        # 2.0.12: JSON-escaped URLs (\/, \u0026) and &amp; are restored so a
+        # plain 'https://scontent...' search finds the links.
+        self.assertEqual(server._facebook_unescape('https:\\/\\/scontent.example.com\\/a.jpg'),
                          'https://scontent.example.com/a.jpg')
-        self.assertEqual(server._json_unescape('https://example.com/a\\u0026b.jpg'),
+        self.assertEqual(server._facebook_unescape('https://example.com/a\\u0026b.jpg'),
                          'https://example.com/a&b.jpg')
-        self.assertEqual(server._json_unescape('https://example.com/plain.jpg'),
-                         'https://example.com/plain.jpg')
+        self.assertEqual(server._facebook_unescape('https://example.com/a.jpg?x=1&amp;y=2'),
+                         'https://example.com/a.jpg?x=1&y=2')
 
-    def test_facebook_json_image_url(self):
-        # 2.0.11: the main photo comes from the JSON in <script> blocks
-        # (gallery-dl's ,"image":{"uri":"..." pattern) when og:image is
-        # absent. The largest image wins when dimensions are present.
-        page = ('<script>,"image":{"uri":"https:\\/\\/scontent.example.com\\/small.jpg",'
-                '"width":100,"height":100},'
+    def test_facebook_target_fbid(self):
+        self.assertEqual(server._facebook_target_fbid(
+            'https://www.facebook.com/photo.php?fbid=10157311924301974&set=p.1&type=3'),
+            '10157311924301974')
+        self.assertIsNone(server._facebook_target_fbid(
+            'https://www.facebook.com/jeremy.koh.5477/posts/10156354288282282'))
+        # A short fbid must not match inside a longer number (e.g. 1080).
+        self.assertFalse(server._facebook_fbid_in('width 1080 height 1080', '1'))
+        self.assertTrue(server._facebook_fbid_in('"id":"10157311924301974"', '10157311924301974'))
+
+    def test_facebook_best_image_url(self):
+        # 2.0.12: the main photo comes from the JSON in <script> blocks,
+        # after unescaping. The URL whose JSON mentions the target fbid
+        # wins even when a larger image is present; without an fbid the
+        # largest image wins.
+        page = ('<script>"id":"10157311924301974",'
+                '"image":{"uri":"https:\\/\\/scontent.example.com\\/target.jpg",'
+                '"width":800,"height":600},'
                 '"image":{"uri":"https:\\/\\/scontent.example.com\\/big.jpg",'
-                '"width":1080,"height":1080},'
-                '"image":{"uri":"https:\\/\\/scontent.example.com\\/mid.jpg",'
-                '"width":500,"height":500}</script>')
-        self.assertEqual(server._facebook_json_image_url(page),
+                '"width":2000,"height":2000}</script>')
+        self.assertEqual(server._facebook_best_image_url(page, '10157311924301974'),
+                         'https://scontent.example.com/target.jpg')
+        page2 = ('<script>"image":{"uri":"https:\\/\\/scontent.example.com\\/small.jpg",'
+                 '"width":100,"height":100},'
+                 '"image":{"uri":"https:\\/\\/scontent.example.com\\/big.jpg",'
+                 '"width":1080,"height":1080}</script>')
+        self.assertEqual(server._facebook_best_image_url(page2, None),
                          'https://scontent.example.com/big.jpg')
-        # No dimensions: the first match wins.
-        page2 = ('<script>,"image":{"uri":"https://scontent.example.com/first.jpg",'
-                 '"foo":1},"image":{"uri":"https://scontent.example.com/second.jpg"}</script>')
-        self.assertEqual(server._facebook_json_image_url(page2),
-                         'https://scontent.example.com/first.jpg')
-        self.assertIsNone(server._facebook_json_image_url('<html><head></head></html>'))
-        self.assertIsNone(server._facebook_json_image_url(
-            '<script>,"image":{"uri":"/relative/path.jpg"}</script>'))
+        # An avatar/profile picture (even the largest) is skipped.
+        page3 = ('<script>"profile_pic":{"uri":"https:\\/\\/scontent.example.com\\/avatar.jpg",'
+                 '"width":2000,"height":2000},'
+                 '"image":{"uri":"https:\\/\\/scontent.example.com\\/photo.jpg",'
+                 '"width":1080,"height":1080}</script>')
+        self.assertEqual(server._facebook_best_image_url(page3, None),
+                         'https://scontent.example.com/photo.jpg')
+        self.assertIsNone(server._facebook_best_image_url('<html><head></head></html>', None))
+        self.assertIsNone(server._facebook_best_image_url(
+            '<script>"image":{"uri":"/relative/path.jpg"}</script>', None))
+
+    def test_facebook_post_photo_fbids(self):
+        # 2.0.12: the attached photos' fbids come from the post page's
+        # "__typename":"Photo","id":"..." nodes, deduplicated.
+        page = ('<script>"__typename":"Photo","id":"111111111111111",'
+                '"__typename":"Photo","id":"222222222222222",'
+                '"__typename":"Photo","id":"111111111111111",'
+                '"__typename":"Video","id":"333333333333333"</script>')
+        self.assertEqual(server._facebook_post_photo_fbids(page),
+                         ['111111111111111', '222222222222222'])
+        self.assertEqual(server._facebook_post_photo_fbids('<html></html>'), [])
+
+    def test_facebook_debug_info(self):
+        # 2.0.12: the debug line counts scontent (raw vs unescaped),
+        # samples image links (JSON key, host+path, dims), and says
+        # whether the target fbid is in the page. It never contains a
+        # cookie value or a query string.
+        page = ('<html><head></head><body><script>'
+                '"id":"10157311924301974",'
+                '"image":{"uri":"https:\\/\\/scontent.example.com\\/photo.jpg?oh=SECRET\\u0026oe=ABC",'
+                '"width":1080,"height":1080}</script></body></html>')
+        info = server._facebook_debug_info(page, '10157311924301974')
+        self.assertIn('scontent trong HTML thô: 1', info)
+        self.assertIn('sau unescape: 1', info)
+        self.assertIn('fbid có trong trang', info)
+        self.assertIn('uri: scontent.example.com/photo.jpg 1080x1080', info)
+        self.assertNotIn('oh=SECRET', info)
+        self.assertNotIn('oe=ABC', info)
 
     def test_parser_falls_back_to_json_image(self):
         # 2.0.11: a logged-in page without og:image but with the JSON
@@ -811,6 +858,84 @@ class FacebookParserTests(unittest.TestCase):
             self.assertEqual(job['status'], 'ready')
             self.assertEqual(job['found'], 1)
             self.assertEqual(job['downloaded'], 1)
+
+    def _posts_page(self, fbids):
+        parts = ['<html><head><title>Facebook</title></head><body><script>']
+        for fbid in fbids:
+            parts.append('"__typename":"Photo","id":"%s",' % fbid)
+        parts.append('</script></body></html>')
+        return ''.join(parts).encode('utf-8')
+
+    def _photo_page(self, fbid, image_url, width=1080, height=1080):
+        page = ('<html><head><title>Facebook</title></head><body><script>'
+                '"id":"%s","image":{"uri":"%s",'
+                '"width":%d,"height":%d}</script></body></html>'
+                % (fbid, image_url.replace('/', '\\/'), width, height))
+        return page.encode('utf-8')
+
+    def test_parser_posts_fetches_each_photo(self):
+        # 2.0.12: a /posts/ URL fetches each attached photo's own page
+        # for the original image (the initial HTML only has the first
+        # few photos, and the photo pages hold the originals).
+        with tempfile.TemporaryDirectory() as tmp:
+            img = b'\xff\xd8\xff\xe0' + b'\x00' * 100
+            opener = _FakeUrlopen([
+                self._posts_page(['111111111111111', '222222222222222']),
+                self._photo_page('111111111111111', 'https://scontent.example.com/p1.jpg'),
+                img,
+                self._photo_page('222222222222222', 'https://scontent.example.com/p2.jpg'),
+                img,
+            ])
+            job = self._parser_job(tmp, 'fbp10',
+                                   'https://www.facebook.com/jeremy.koh.5477/posts/10156354288282282',
+                                   opener, self._cookie_file(tmp))
+            self.assertEqual(job['status'], 'ready')
+            self.assertEqual(job['found'], 2)
+            self.assertEqual(job['downloaded'], 2)
+            self.assertEqual([Path(p).name for p in job['image_files']], ['01.jpg', '02.jpg'])
+            self.assertNotIn('warning', job)
+
+    def test_parser_posts_partial_warning(self):
+        # 2.0.12: when one attached photo's page has no image, the job
+        # still returns the others with a found/downloaded warning.
+        with tempfile.TemporaryDirectory() as tmp:
+            img = b'\xff\xd8\xff\xe0' + b'\x00' * 100
+            opener = _FakeUrlopen([
+                self._posts_page(['111111111111111', '222222222222222']),
+                self._photo_page('111111111111111', 'https://scontent.example.com/p1.jpg'),
+                img,
+                b'<html><head><title>Facebook</title></head><body>no photo</body></html>',
+            ])
+            job = self._parser_job(tmp, 'fbp11',
+                                   'https://www.facebook.com/jeremy.koh.5477/posts/10156354288282282',
+                                   opener, self._cookie_file(tmp))
+            self.assertEqual(job['status'], 'ready')
+            self.assertEqual(job['found'], 2)
+            self.assertEqual(job['downloaded'], 1)
+            self.assertEqual(job['warning'], 'Chỉ tải được 1/2 ảnh.')
+
+    def test_parser_debug_line_only_with_env(self):
+        # 2.0.12: the [Debug: ...] line appears only when HIMTIK_FB_DEBUG
+        # is set, and never contains a cookie value. The page below has
+        # only an avatar image (blocklisted), so no photo is found and
+        # the error is raised with the debug line.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = ('<html><head><title>Facebook</title></head><body><script>'
+                    '"profile_pic":{"uri":"https:\\/\\/scontent.example.com\\/avatar.jpg",'
+                    '"width":200,"height":200}</script></body></html>').encode('utf-8')
+            with self.assertRaises(ValueError) as cm:
+                with patch.dict(os.environ, {'HIMTIK_FB_DEBUG': '1'}):
+                    self._parser_job(tmp, 'fbp12', 'https://www.facebook.com/photo.php?fbid=1',
+                                     _FakeUrlopen([page]), self._cookie_file(tmp))
+            msg = str(cm.exception)
+            self.assertIn('[Debug: scontent trong HTML thô:', msg)
+            self.assertIn('uri: scontent.example.com/avatar.jpg 200x200', msg)
+            self.assertNotIn('123', msg)
+            # Without the env var there is no debug line.
+            with self.assertRaises(ValueError) as cm2:
+                self._parser_job(tmp, 'fbp13', 'https://www.facebook.com/photo.php?fbid=1',
+                                 _FakeUrlopen([page]), self._cookie_file(tmp))
+            self.assertNotIn('[Debug:', str(cm2.exception))
 
     def test_parser_sends_sec_fetch_headers(self):
         # 2.0.11: the parser sends gallery-dl's Sec-Fetch headers — without
