@@ -1,4 +1,5 @@
 import http.client
+import http.cookiejar
 import json
 import os
 import tempfile
@@ -558,14 +559,14 @@ class _FakeHTTPResponse:
         return self._data if n < 0 else self._data[:n]
 
 
-class _FakeOpener:
-    """Fake urllib opener: serves canned byte responses in call order."""
+class _FakeUrlopen:
+    """Fake urllib.request.urlopen: serves canned byte responses in order."""
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
 
-    def open(self, request, timeout=None):
+    def __call__(self, request, timeout=None):
         self.calls.append(request)
         return _FakeHTTPResponse(self._responses.pop(0))
 
@@ -610,12 +611,37 @@ class FacebookParserTests(unittest.TestCase):
             '<meta property="og:image:secure_url" content="https://example.com/c.jpg">'),
             'https://example.com/c.jpg')
 
+    def test_netscape_cookie_header_tolerates_cookie_editor_export(self):
+        # Regression test for the live 2.0.7 failure: Cookie-Editor writes
+        # leading-dot domains (".facebook.com") with the domain flag FALSE,
+        # and CPython's MozillaCookieJar refuses the whole file over that
+        # (LoadError: assert domain_specified == initial_dot). The parser
+        # therefore reads the file by hand. Bad lines are skipped, cookies
+        # for other hosts and out-of-scope paths are left out.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'fb.txt')
+            path.write_text(
+                '# Netscape HTTP Cookie File\n'
+                '#HttpOnly_.facebook.com\tFALSE\t/\tTRUE\t0\tc_user\t123\n'
+                '#HttpOnly_.facebook.com\tFALSE\t/login/device-based/\tTRUE\t0\tdbln\tx\n'
+                '.facebook.com\tFALSE\t/\tTRUE\t0\tsb\tabc\n'
+                '.instagram.com\tFALSE\t/\tTRUE\t0\tsessionid\tnope\n'
+                'garbage line without tabs\n')
+            header = server._netscape_cookie_header(
+                str(path), 'https://www.facebook.com/photo.php?fbid=1')
+            self.assertEqual(header, 'c_user=123; sb=abc')
+            # The same file must ALSO be loadable the old way? No: it is
+            # exactly the shape MozillaCookieJar rejects, which is the point.
+            with self.assertRaises(Exception):
+                jar = http.cookiejar.MozillaCookieJar(str(path))
+                jar.load(ignore_discard=True, ignore_expires=True)
+
     def _parser_job(self, tmp, jid, url, opener, cookie_file):
         with server.LOCK:
             server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
         folder = Path(tmp, jid)
         folder.mkdir(parents=True, exist_ok=True)
-        with patch('server.urllib.request.build_opener', return_value=opener):
+        with patch('server.urllib.request.urlopen', opener):
             server._download_images_facebook_parser(jid, url, folder, cookie_file)
         with server.LOCK:
             return dict(server.JOBS[jid])
@@ -624,7 +650,7 @@ class FacebookParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             img = b'\xff\xd8\xff' + b'fbimg'
             page = self._page('https://scontent.example.com/photo.jpg?stp=abc&amp;oh=123')
-            opener = _FakeOpener([page, img])
+            opener = _FakeUrlopen([page, img])
             job = self._parser_job(tmp, 'fbp1', 'https://www.facebook.com/photo.php?fbid=1',
                                    opener, self._cookie_file(tmp))
             self.assertEqual(job['status'], 'ready')
@@ -641,7 +667,7 @@ class FacebookParserTests(unittest.TestCase):
 
     def test_parser_no_og_image(self):
         with tempfile.TemporaryDirectory() as tmp:
-            opener = _FakeOpener([self._page()])
+            opener = _FakeUrlopen([self._page()])
             with self.assertRaises(ValueError) as cm:
                 self._parser_job(tmp, 'fbp2', 'https://www.facebook.com/photo.php?fbid=1',
                                  opener, self._cookie_file(tmp))
@@ -649,7 +675,7 @@ class FacebookParserTests(unittest.TestCase):
 
     def test_parser_video_post_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
-            opener = _FakeOpener([self._page('https://scontent.example.com/t.jpg', video=True)])
+            opener = _FakeUrlopen([self._page('https://scontent.example.com/t.jpg', video=True)])
             with self.assertRaises(ValueError) as cm:
                 self._parser_job(tmp, 'fbp3', 'https://www.facebook.com/photo.php?fbid=1',
                                  opener, self._cookie_file(tmp))
@@ -662,7 +688,7 @@ class FacebookParserTests(unittest.TestCase):
         server.STORAGE = Path(tmp)
         try:
             with patch('server.subprocess.run') as run, \
-                 patch('server.urllib.request.build_opener', return_value=opener), \
+                 patch('server.urllib.request.urlopen', opener), \
                  patch.dict(os.environ, env):
                 run.side_effect = simulate
                 server.download_media(jid, url, 'image')
@@ -683,7 +709,7 @@ class FacebookParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             img = b'\xff\xd8\xff' + b'fbimg'
             page = self._page('https://scontent.example.com/photo.jpg')
-            opener = _FakeOpener([page, img])
+            opener = _FakeUrlopen([page, img])
             simulate = self._gallery_fail_simulate(
                 probe_stderr="[facebook][error] An unexpected error occurred: KeyError - 'fbid'.")
             job = self._fallback_job(tmp, 'fbf1', 'https://www.facebook.com/photo.php?fbid=1',
@@ -697,7 +723,7 @@ class FacebookParserTests(unittest.TestCase):
 
     def test_gallery_facebook_no_fallback_on_login(self):
         with tempfile.TemporaryDirectory() as tmp:
-            opener = _FakeOpener([b'<html></html>'])
+            opener = _FakeUrlopen([b'<html></html>'])
             simulate = self._gallery_fail_simulate(
                 probe_rc=16,
                 probe_stderr='[facebook][error] AuthRequired: You must be logged in to continue viewing images.')
@@ -710,7 +736,7 @@ class FacebookParserTests(unittest.TestCase):
 
     def test_gallery_facebook_no_fallback_on_video(self):
         with tempfile.TemporaryDirectory() as tmp:
-            opener = _FakeOpener([b'<html></html>'])
+            opener = _FakeUrlopen([b'<html></html>'])
 
             def simulate(command, **kwargs):
                 if '--get-urls' in command:
@@ -734,7 +760,7 @@ class FacebookParserTests(unittest.TestCase):
         # 2.0.7: when the parser runs and fails, the job carries the
         # parser's own (more specific) error, not the gallery-dl one.
         with tempfile.TemporaryDirectory() as tmp:
-            opener = _FakeOpener([self._page()])
+            opener = _FakeUrlopen([self._page()])
             simulate = self._gallery_fail_simulate(
                 probe_stderr="[facebook][error] An unexpected error occurred: KeyError - 'fbid'.")
             job = self._fallback_job(tmp, 'fbf5', 'https://www.facebook.com/photo.php?fbid=1',
@@ -749,7 +775,7 @@ class FacebookParserTests(unittest.TestCase):
         # refused (e.g. expired cookies), not a missing photo.
         with tempfile.TemporaryDirectory() as tmp:
             page = b'<html><head><title>Log in</title></head><body>you must be logged in</body></html>'
-            opener = _FakeOpener([page])
+            opener = _FakeUrlopen([page])
             simulate = self._gallery_fail_simulate(
                 probe_stderr="[facebook][error] An unexpected error occurred: KeyError - 'fbid'.")
             job = self._fallback_job(tmp, 'fbf6', 'https://www.facebook.com/photo.php?fbid=1',
@@ -760,7 +786,7 @@ class FacebookParserTests(unittest.TestCase):
 
     def test_gallery_instagram_no_parser_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
-            opener = _FakeOpener([b'<html></html>'])
+            opener = _FakeUrlopen([b'<html></html>'])
             simulate = self._gallery_fail_simulate(
                 probe_stderr='[instagram][error] HTTP 429 Too Many Requests')
             job = self._fallback_job(tmp, 'fbf4', 'https://www.instagram.com/p/AbCd/',
