@@ -767,6 +767,65 @@ class FacebookParserTests(unittest.TestCase):
             self.assertIn('khớp c_user: đúng', msg)
             self.assertNotIn('123', msg)
 
+    def test_json_unescape(self):
+        # 2.0.11: JSON-escaped URLs (\/, \uXXXX) are restored.
+        self.assertEqual(server._json_unescape('https:\\/\\/scontent.example.com\\/a.jpg'),
+                         'https://scontent.example.com/a.jpg')
+        self.assertEqual(server._json_unescape('https://example.com/a\\u0026b.jpg'),
+                         'https://example.com/a&b.jpg')
+        self.assertEqual(server._json_unescape('https://example.com/plain.jpg'),
+                         'https://example.com/plain.jpg')
+
+    def test_facebook_json_image_url(self):
+        # 2.0.11: the main photo comes from the JSON in <script> blocks
+        # (gallery-dl's ,"image":{"uri":"..." pattern) when og:image is
+        # absent. The largest image wins when dimensions are present.
+        page = ('<script>,"image":{"uri":"https:\\/\\/scontent.example.com\\/small.jpg",'
+                '"width":100,"height":100},'
+                '"image":{"uri":"https:\\/\\/scontent.example.com\\/big.jpg",'
+                '"width":1080,"height":1080},'
+                '"image":{"uri":"https:\\/\\/scontent.example.com\\/mid.jpg",'
+                '"width":500,"height":500}</script>')
+        self.assertEqual(server._facebook_json_image_url(page),
+                         'https://scontent.example.com/big.jpg')
+        # No dimensions: the first match wins.
+        page2 = ('<script>,"image":{"uri":"https://scontent.example.com/first.jpg",'
+                 '"foo":1},"image":{"uri":"https://scontent.example.com/second.jpg"}</script>')
+        self.assertEqual(server._facebook_json_image_url(page2),
+                         'https://scontent.example.com/first.jpg')
+        self.assertIsNone(server._facebook_json_image_url('<html><head></head></html>'))
+        self.assertIsNone(server._facebook_json_image_url(
+            '<script>,"image":{"uri":"/relative/path.jpg"}</script>'))
+
+    def test_parser_falls_back_to_json_image(self):
+        # 2.0.11: a logged-in page without og:image but with the JSON
+        # image pattern downloads that photo (the live 2.0.10 case).
+        with tempfile.TemporaryDirectory() as tmp:
+            page = ('<html><head><title>Facebook</title></head><body><script>'
+                    ',"image":{"uri":"https:\\/\\/scontent.example.com\\/photo.jpg",'
+                    '"width":1080,"height":1080}</script></body></html>').encode('utf-8')
+            image = b'\xff\xd8\xff\xe0' + b'\x00' * 100
+            opener = _FakeUrlopen([page, image])
+            job = self._parser_job(tmp, 'fbp8', 'https://www.facebook.com/photo.php?fbid=1',
+                                   opener, self._cookie_file(tmp))
+            self.assertEqual(job['status'], 'ready')
+            self.assertEqual(job['found'], 1)
+            self.assertEqual(job['downloaded'], 1)
+
+    def test_parser_sends_sec_fetch_headers(self):
+        # 2.0.11: the parser sends gallery-dl's Sec-Fetch headers — without
+        # them Facebook answers HTTP 400 to some URLs (verified locally:
+        # /posts/ went 400 -> 200 once Sec-Fetch was added).
+        with tempfile.TemporaryDirectory() as tmp:
+            opener = _FakeUrlopen([self._page('https://scontent.example.com/p.jpg'),
+                                   b'\xff\xd8\xff\xe0' + b'\x00' * 100])
+            self._parser_job(tmp, 'fbp9', 'https://www.facebook.com/photo.php?fbid=1',
+                             opener, self._cookie_file(tmp))
+            headers = {k.lower(): v for k, v in opener.calls[0].headers.items()}
+            self.assertEqual(headers.get('sec-fetch-dest'), 'empty')
+            self.assertEqual(headers.get('sec-fetch-mode'), 'navigate')
+            self.assertEqual(headers.get('sec-fetch-site'), 'same-origin')
+
     def test_parser_video_post_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             opener = _FakeUrlopen([self._page('https://scontent.example.com/t.jpg', video=True)])
