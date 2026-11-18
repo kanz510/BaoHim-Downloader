@@ -540,6 +540,30 @@ def _gallery_login_error(cookie_file: str | None) -> str:
     return "Bài này cần đăng nhập, chưa có cookie."
 
 
+def _gallery_verbose_log(url: str, cookie_file: str | None) -> str:
+    """Run gallery-dl -v --get-urls and return a sanitised excerpt of its
+    debug log (for HIMTIK_FB_DEBUG, HAND OFF 3 step 1). Cookie values are
+    never included: any line mentioning cookies (or a cookie name/value
+    pattern) is dropped, and the log is truncated to the last 30 lines.
+    Returns "" when gallery-dl is unavailable or the run times out."""
+    cmd = _gallery_cmd(cookie_file) + ["-v", "--get-urls", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=GALLERY_PROBE_TIMEOUT, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    lines = []
+    for line in (result.stderr or "").splitlines():
+        low = line.lower()
+        if "cookie" in low:
+            continue
+        if "c_user" in low or "xs=" in low:
+            continue
+        lines.append(line)
+    lines = lines[-30:]
+    return " | ".join(line.strip() for line in lines if line.strip())
+
+
 def _gallery_probe(url: str, cookie_file: str | None) -> int:
     """Count the media URLs gallery-dl finds for the post, without
     downloading. Raises ValueError (user-facing message) on login, on an
@@ -1073,7 +1097,15 @@ def _download_images_gallery(job_id: str, url: str, folder: Path) -> None:
             message = str(exc)
             if (platform == "facebook" and cookie_file
                     and not message.startswith(_FB_PARSER_SKIP_PREFIXES)):
-                _download_images_facebook_parser(job_id, url, folder, cookie_file)
+                gallery_log = ""
+                if os.environ.get("HIMTIK_FB_DEBUG"):
+                    gallery_log = _gallery_verbose_log(url, cookie_file)
+                try:
+                    _download_images_facebook_parser(job_id, url, folder, cookie_file)
+                except ValueError as parser_exc:
+                    if gallery_log:
+                        raise ValueError(f"{parser_exc} [gallery-dl -v: {gallery_log}]")
+                    raise
                 return
             raise
     finally:
@@ -1169,7 +1201,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.12"
+    server_version = "HimTik/2.0.13"
     sys_version = ""
 
     def log_message(self, fmt, *args):
