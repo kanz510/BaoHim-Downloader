@@ -569,6 +569,17 @@ _OG_IMAGE_SECURE_RE = re.compile(
     re.IGNORECASE)
 _OG_VIDEO_RE = re.compile(
     r'<meta[^>]+property=["\']og:video["\']', re.IGNORECASE)
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _page_title(page_html: str) -> str:
+    """The page <title>, cleaned and truncated; "" when absent. Used only
+    to say what kind of page Facebook served when og:image is missing."""
+    match = _TITLE_RE.search(page_html)
+    if not match:
+        return ""
+    title = html.unescape(match.group(1)).strip()
+    return re.sub(r"\s+", " ", title)[:60]
 
 
 def _facebook_og_image_url(page_html: str) -> str | None:
@@ -651,6 +662,8 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
     try:
         with urllib.request.urlopen(page_request, timeout=FB_PARSER_PAGE_TIMEOUT) as resp:
             page = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"Không đọc được bài đăng (HTTP {exc.code}). Hãy thử liên kết công khai khác.")
     except (urllib.error.URLError, OSError):
         raise ValueError("Không đọc được bài đăng. Hãy thử liên kết công khai khác.")
     if _OG_VIDEO_RE.search(page):
@@ -659,7 +672,9 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
     if not image_url:
         if _gallery_login_required(page):
             raise ValueError(_gallery_login_error(cookie_file))
-        raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+        title = _page_title(page)
+        detail = f" (Trang: {title})" if title else ""
+        raise ValueError(f"Không tìm thấy ảnh nào trong bài đăng này.{detail}")
     image_request = urllib.request.Request(image_url, headers=headers)
     try:
         with urllib.request.urlopen(image_request, timeout=FB_PARSER_IMAGE_TIMEOUT) as resp:
@@ -858,7 +873,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.8"
+    server_version = "HimTik/2.0.9"
     sys_version = ""
 
     def log_message(self, fmt, *args):
