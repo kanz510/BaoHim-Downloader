@@ -74,6 +74,14 @@ FB_PARSER_PAGE_TIMEOUT = 30
 FB_PARSER_IMAGE_TIMEOUT = 60
 FB_PARSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+# Facebook serves a stripped page to bare requests, so the parser sends
+# browser-like headers (2.0.7).
+FB_PARSER_HEADERS = {
+    "User-Agent": FB_PARSER_UA,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+}
 # Gallery errors that must NOT fall back to the Facebook parser: a login
 # failure (the parser needs a session too), the 30-image cap, the 120 MB
 # cap, and video posts (the parser would return a video thumbnail).
@@ -557,13 +565,17 @@ _OG_IMAGE_RE = re.compile(
 _OG_IMAGE_RE_REV = re.compile(
     r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
     re.IGNORECASE)
+_OG_IMAGE_SECURE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
+    re.IGNORECASE)
 _OG_VIDEO_RE = re.compile(
     r'<meta[^>]+property=["\']og:video["\']', re.IGNORECASE)
 
 
 def _facebook_og_image_url(page_html: str) -> str | None:
-    """The og:image URL of a Facebook photo page, or None when absent."""
-    for pattern in (_OG_IMAGE_RE, _OG_IMAGE_RE_REV):
+    """The og:image URL of a Facebook photo page, or None when absent.
+    Falls back to og:image:secure_url when og:image itself is missing."""
+    for pattern in (_OG_IMAGE_RE, _OG_IMAGE_RE_REV, _OG_IMAGE_SECURE_RE):
         match = pattern.search(page_html)
         if match:
             url = html.unescape(match.group(1)).strip()
@@ -598,7 +610,7 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
     except OSError:
         raise ValueError("Không đọc được cookie Facebook.")
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    page_request = urllib.request.Request(url, headers={"User-Agent": FB_PARSER_UA})
+    page_request = urllib.request.Request(url, headers=FB_PARSER_HEADERS)
     try:
         with opener.open(page_request, timeout=FB_PARSER_PAGE_TIMEOUT) as resp:
             page = resp.read().decode("utf-8", "replace")
@@ -608,8 +620,10 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
         raise ValueError("Bài đăng này là video, hãy chọn loại Video.")
     image_url = _facebook_og_image_url(page)
     if not image_url:
+        if _gallery_login_required(page):
+            raise ValueError(_gallery_login_error(cookie_file))
         raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
-    image_request = urllib.request.Request(image_url, headers={"User-Agent": FB_PARSER_UA})
+    image_request = urllib.request.Request(image_url, headers=FB_PARSER_HEADERS)
     try:
         with opener.open(image_request, timeout=FB_PARSER_IMAGE_TIMEOUT) as resp:
             data = resp.read(MAX_BYTES + 1)
@@ -705,13 +719,13 @@ def _download_images_gallery(job_id: str, url: str, folder: Path) -> None:
             # Facebook fallback: gallery-dl's extractor cannot parse some
             # photo pages. Try the og:image parser when FB cookies are
             # configured; login/cap/size/video failures are re-raised as-is.
+            # The parser's own error propagates (it is the most specific
+            # one: it says whether the page, the og:image, or the image
+            # download failed) instead of the generic gallery-dl error.
             message = str(exc)
             if (platform == "facebook" and cookie_file
                     and not message.startswith(_FB_PARSER_SKIP_PREFIXES)):
-                try:
-                    _download_images_facebook_parser(job_id, url, folder, cookie_file)
-                except ValueError:
-                    raise exc
+                _download_images_facebook_parser(job_id, url, folder, cookie_file)
                 return
             raise
     finally:
@@ -807,7 +821,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.6"
+    server_version = "HimTik/2.0.7"
     sys_version = ""
 
     def log_message(self, fmt, *args):
