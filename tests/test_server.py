@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from http.server import ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -306,7 +307,7 @@ class ImageTests(unittest.TestCase):
                     Path(tmp, jid, 'NA_ccc.jpg').write_bytes(b'\xff\xd8\xff' + b'jpg')
                     return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
                 run.side_effect = simulate
-                server.download_media(jid, 'https://www.instagram.com/p/AbCd/', 'image')
+                server.download_media(jid, 'https://www.tiktok.com/@abc/photo/123', 'image')
                 with server.LOCK:
                     self.assertEqual(server.JOBS[jid]['status'], 'ready')
                     self.assertEqual([Path(p).name for p in server.JOBS[jid]['image_files']], ['01.jpg'])
@@ -356,6 +357,190 @@ class ImageTests(unittest.TestCase):
             finally:
                 server.STORAGE = old_storage
                 server.MAX_BYTES = old_max
+
+
+class GalleryTests(unittest.TestCase):
+    """Instagram/Facebook photo posts go through gallery-dl (2.0.5)."""
+
+    def setUp(self):
+        with server.LOCK:
+            server.META_CACHE.clear()
+            server.JOBS.clear()
+
+    def _gallery_simulate(self, tmp, jid, probe_stdout, probe_rc=0, probe_stderr='',
+                          download_files=(), download_rc=0, download_stderr=''):
+        """Mock subprocess.run: probe (--get-urls) prints URLs, download writes files."""
+        calls = []
+        def simulate(command, **kwargs):
+            calls.append(list(command))
+            if '--get-urls' in command:
+                return type('Result', (), {'returncode': probe_rc, 'stdout': probe_stdout,
+                                           'stderr': probe_stderr})()
+            folder = Path(tmp, jid)
+            for rel, data in download_files:
+                p = folder / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+            return type('Result', (), {'returncode': download_rc, 'stdout': '',
+                                       'stderr': download_stderr})()
+        return simulate, calls
+
+    def _run_job(self, tmp, jid, url, simulate):
+        with server.LOCK:
+            server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+        with patch('server.subprocess.run') as run:
+            run.side_effect = simulate
+            server.download_media(jid, url, 'image')
+        with server.LOCK:
+            return dict(server.JOBS[jid])
+
+    def test_gallery_platform_detection(self):
+        self.assertEqual(server._gallery_platform('https://www.instagram.com/p/AbCd/'), 'instagram')
+        self.assertEqual(server._gallery_platform('https://www.facebook.com/photo.php?fbid=1'), 'facebook')
+        self.assertIsNone(server._gallery_platform('https://www.tiktok.com/@a/photo/1'))
+        self.assertIsNone(server._gallery_platform('https://fb.watch/abc'))
+
+    @patch('server.subprocess.run')
+    def test_gallery_single_image_served_as_file(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jpg = b'\xff\xd8\xff' + b'jpg1'
+                simulate, calls = self._gallery_simulate(
+                    tmp, 'gal1', 'https://cdn.example.com/1.jpg\n',
+                    download_files=[('instagram/user/abc_1.jpg', jpg)])
+                run.side_effect = simulate
+                job = self._run_job(tmp, 'gal1', 'https://www.instagram.com/p/AbCd/', simulate)
+                self.assertEqual(job['status'], 'ready')
+                self.assertEqual(job['found'], 1)
+                self.assertEqual(job['downloaded'], 1)
+                self.assertNotIn('warning', job)
+                self.assertNotIn('filename', job)
+                self.assertEqual([Path(p).name for p in job['image_files']], ['01.jpg'])
+                # No cookies configured: no --cookies flag anywhere.
+                self.assertTrue(all('--cookies' not in c for c in calls))
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_gallery_multiple_images_zipped(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jpgs = [b'\xff\xd8\xff' + bytes([i]) * 4 for i in range(3)]
+                probe = '\n'.join(f'https://cdn.example.com/{i}.jpg' for i in range(3)) + '\n'
+                simulate, _ = self._gallery_simulate(
+                    tmp, 'gal3', probe,
+                    download_files=[(f'instagram/user/{i}.jpg', jpgs[i]) for i in range(3)])
+                run.side_effect = simulate
+                job = self._run_job(tmp, 'gal3', 'https://www.instagram.com/p/AbCd/', simulate)
+                self.assertEqual(job['status'], 'ready')
+                self.assertEqual(job['found'], 3)
+                self.assertEqual(job['downloaded'], 3)
+                self.assertNotIn('warning', job)
+                self.assertNotIn('image_files', job)
+                self.assertTrue(job['filename'].endswith('photos.zip'))
+                self.assertEqual(job['bytes'], Path(job['filename']).stat().st_size)
+                with zipfile.ZipFile(job['filename']) as zf:
+                    self.assertEqual(zf.namelist(), ['01.jpg', '02.jpg', '03.jpg'])
+                    self.assertEqual(zf.read('02.jpg'), jpgs[1])
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_gallery_login_required_no_cookie(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                simulate, calls = self._gallery_simulate(
+                    tmp, 'galfb', '', probe_rc=16,
+                    probe_stderr='[facebook][error] AuthRequired: You must be logged in to continue viewing images.')
+                run.side_effect = simulate
+                job = self._run_job(tmp, 'galfb', 'https://www.facebook.com/photo.php?fbid=1', simulate)
+                self.assertEqual(job['status'], 'error')
+                self.assertEqual(job['error'], 'Bài này cần đăng nhập, chưa có cookie.')
+                self.assertEqual(len(calls), 1)  # probe only, no download attempt
+                self.assertTrue(all('--cookies' not in c for c in calls))
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_gallery_login_required_with_cookie(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                cookie_text = ('# Netscape HTTP Cookie File\n'
+                               '.instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tfake-test-value')
+                simulate, calls = self._gallery_simulate(
+                    tmp, 'galig', '', probe_rc=4,
+                    probe_stderr='[instagram][error] HTTP redirect to login page (https://www.instagram.com/accounts/login/)')
+                run.side_effect = simulate
+                with patch.dict(os.environ, {'IG_COOKIES': cookie_text}):
+                    job = self._run_job(tmp, 'galig', 'https://www.instagram.com/p/AbCd/', simulate)
+                self.assertEqual(job['status'], 'error')
+                self.assertEqual(job['error'], 'Bài này cần đăng nhập, cookie có thể đã hết hạn.')
+                self.assertIn('--cookies', calls[0])
+                cookie_path = calls[0][calls[0].index('--cookies') + 1]
+                self.assertFalse(Path(cookie_path).exists())  # temp cookie file deleted
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_gallery_partial_download_warns(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                probe = '\n'.join(f'https://cdn.example.com/{i}.jpg' for i in range(8)) + '\n'
+                simulate, _ = self._gallery_simulate(
+                    tmp, 'gal8', probe,
+                    download_files=[(f'instagram/user/{i}.jpg', b'\xff\xd8\xff' + bytes([i])) for i in range(3)])
+                run.side_effect = simulate
+                job = self._run_job(tmp, 'gal8', 'https://www.instagram.com/p/AbCd/', simulate)
+                self.assertEqual(job['status'], 'ready')
+                self.assertEqual(job['found'], 8)
+                self.assertEqual(job['downloaded'], 3)
+                self.assertEqual(job['warning'], 'Chỉ tải được 3/8 ảnh.')
+                self.assertTrue(job['filename'].endswith('photos.zip'))
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_gallery_video_post_rejected(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                simulate, _ = self._gallery_simulate(
+                    tmp, 'galvid', 'https://cdn.example.com/clip.mp4\n',
+                    download_files=[('instagram/user/clip.mp4',
+                                     b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00video')])
+                run.side_effect = simulate
+                job = self._run_job(tmp, 'galvid', 'https://www.instagram.com/p/AbCd/', simulate)
+                self.assertEqual(job['status'], 'error')
+                self.assertIn('video', job['error'])
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.subprocess.run')
+    def test_gallery_over_30_rejected(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                probe = '\n'.join(f'https://cdn.example.com/{i}.jpg' for i in range(31)) + '\n'
+                simulate, calls = self._gallery_simulate(tmp, 'gal31', probe)
+                run.side_effect = simulate
+                job = self._run_job(tmp, 'gal31', 'https://www.instagram.com/p/AbCd/', simulate)
+                self.assertEqual(job['status'], 'error')
+                self.assertIn('30', job['error'])
+                self.assertEqual(len(calls), 1)  # probe only, no download attempt
+            finally:
+                server.STORAGE = old_storage
 
 
 class HttpTests(unittest.TestCase):
@@ -691,6 +876,56 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(status, 404)
                 status, _, _ = self.request('/api/files/' + jid + '/abc')
                 self.assertEqual(status, 404)
+            finally:
+                server.STORAGE = old_storage
+
+    @patch('server.inspect_media')
+    @patch('server.POOL.submit')
+    def test_download_ig_image_skips_ytdlp_inspect(self, submit, mock_inspect):
+        # Instagram/Facebook photo posts go through gallery-dl, so the
+        # yt-dlp inspect pre-check is skipped for them entirely.
+        status, body, _ = self.request('/api/download', {'url': 'https://www.instagram.com/p/AbCd/', 'type': 'image'})
+        self.assertEqual(status, 202)
+        self.assertEqual(json.loads(body)['status'], 'queued')
+        submit.assert_called_once()
+        mock_inspect.assert_not_called()
+
+    @patch('server.subprocess.run')
+    def test_gallery_zip_job_payload_and_download(self, run):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_storage = server.STORAGE
+            server.STORAGE = Path(tmp)
+            try:
+                jid = 'galzip'
+                with server.LOCK:
+                    server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+                def simulate(command, **kwargs):
+                    if '--get-urls' in command:
+                        return type('Result', (), {'returncode': 0,
+                                                   'stdout': 'https://cdn.example.com/0.jpg\nhttps://cdn.example.com/1.jpg\n',
+                                                   'stderr': ''})()
+                    folder = Path(tmp, jid)
+                    (folder / 'instagram' / 'user').mkdir(parents=True, exist_ok=True)
+                    (folder / 'instagram' / 'user' / '0.jpg').write_bytes(b'\xff\xd8\xff' + b'a')
+                    (folder / 'instagram' / 'user' / '1.jpg').write_bytes(b'\xff\xd8\xff' + b'b')
+                    return type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+                run.side_effect = simulate
+                server.download_media(jid, 'https://www.instagram.com/p/AbCd/', 'image')
+                status, body, _ = self.request('/api/jobs/' + jid)
+                data = json.loads(body)
+                self.assertEqual(status, 200)
+                self.assertEqual(data['status'], 'ready')
+                self.assertEqual(data['found'], 2)
+                self.assertEqual(data['downloaded'], 2)
+                self.assertNotIn('warning', data)
+                self.assertNotIn('files', data)
+                self.assertEqual(data['download_url'], '/api/files/' + jid)
+                status, body, headers = self.request('/api/files/' + jid)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get('Content-Type'), 'application/zip')
+                self.assertIn('attachment', headers.get('Content-Disposition'))
+                with zipfile.ZipFile(BytesIO(body)) as zf:
+                    self.assertEqual(zf.namelist(), ['01.jpg', '02.jpg'])
             finally:
                 server.STORAGE = old_storage
 
