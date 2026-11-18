@@ -605,8 +605,10 @@ class FacebookParserTests(unittest.TestCase):
         self.assertEqual(server._facebook_og_image_url(html2),
                          'https://scontent.example.com/b.png')
         self.assertIsNone(server._facebook_og_image_url('<html><head></head></html>'))
-        self.assertIsNone(server._facebook_og_image_url(
-            '<meta property="og:image:secure_url" content="https://example.com/c.jpg">'))
+        # og:image:secure_url is the fallback when og:image itself is absent.
+        self.assertEqual(server._facebook_og_image_url(
+            '<meta property="og:image:secure_url" content="https://example.com/c.jpg">'),
+            'https://example.com/c.jpg')
 
     def _parser_job(self, tmp, jid, url, opener, cookie_file):
         with server.LOCK:
@@ -727,6 +729,34 @@ class FacebookParserTests(unittest.TestCase):
             self.assertEqual(job['status'], 'error')
             self.assertIn('video', job['error'])
             self.assertEqual(opener.calls, [])
+
+    def test_parser_error_propagates_not_gallery_error(self):
+        # 2.0.7: when the parser runs and fails, the job carries the
+        # parser's own (more specific) error, not the gallery-dl one.
+        with tempfile.TemporaryDirectory() as tmp:
+            opener = _FakeOpener([self._page()])
+            simulate = self._gallery_fail_simulate(
+                probe_stderr="[facebook][error] An unexpected error occurred: KeyError - 'fbid'.")
+            job = self._fallback_job(tmp, 'fbf5', 'https://www.facebook.com/photo.php?fbid=1',
+                                     simulate, opener,
+                                     {'FB_COOKIES': self.FB_COOKIE_TEXT})
+            self.assertEqual(job['status'], 'error')
+            self.assertEqual(job['error'], 'Không tìm thấy ảnh nào trong bài đăng này.')
+            self.assertEqual(len(opener.calls), 1)
+
+    def test_parser_login_page_reports_login_error(self):
+        # A page with no og:image but login markers means the session was
+        # refused (e.g. expired cookies), not a missing photo.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = b'<html><head><title>Log in</title></head><body>you must be logged in</body></html>'
+            opener = _FakeOpener([page])
+            simulate = self._gallery_fail_simulate(
+                probe_stderr="[facebook][error] An unexpected error occurred: KeyError - 'fbid'.")
+            job = self._fallback_job(tmp, 'fbf6', 'https://www.facebook.com/photo.php?fbid=1',
+                                     simulate, opener,
+                                     {'FB_COOKIES': self.FB_COOKIE_TEXT})
+            self.assertEqual(job['status'], 'error')
+            self.assertEqual(job['error'], 'Bài này cần đăng nhập, cookie có thể đã hết hạn.')
 
     def test_gallery_instagram_no_parser_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
