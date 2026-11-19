@@ -576,6 +576,8 @@ class _FakeUrlopen:
     def __call__(self, request, timeout=None):
         self.calls.append(request)
         item = self._responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
         if isinstance(item, _FakeHTTPResponse):
             return item
         return _FakeHTTPResponse(item)
@@ -1122,6 +1124,284 @@ class FacebookParserTests(unittest.TestCase):
             self.assertEqual(job['status'], 'error')
             self.assertEqual(job['error'], 'Không đọc được bài đăng. Hãy thử liên kết công khai khác.')
             self.assertEqual(opener.calls, [])
+
+
+class FetchSocialTests(unittest.TestCase):
+    """FetchSocial (RapidAPI) fallback for Facebook /share/p/ photo
+    links (2.0.14). The sample response mirrors the verified live
+    /share/p/ call (2026-11-19): 4 real photos in downloadUrlList,
+    avatar in a separate field, no width/height."""
+
+    SHARE_URL = 'https://www.facebook.com/share/p/19sDYNzoaC/'
+    FB_COOKIE_TEXT = FacebookParserTests.FB_COOKIE_TEXT
+
+    # Shaped like the real FetchSocial response for the share link above.
+    RESPONSE = {
+        "status": 200, "message": "",
+        "data": {
+            "platform": "facebook", "platformCode": "fb",
+            "fetchType": "single_post", "name": "Nguyễn Hoàng Việt",
+            "uniqueId": "fallinluv2003",
+            "postId": "480547719828045",
+            "publicTime": "2021-05-02T15:47:52+08:00",
+            "description": "Lại một kỉ niệm để nhớ",
+            "avatar": "https://scontent.example.com/avatar.jpg",
+            "downloadUrlList": [
+                {"type": "pic",
+                 "cover": "https://scontent.example.com/photo1.jpg",
+                 "sourceUrl": "https://scontent.example.com/photo1.jpg",
+                 "size": None, "width": None, "height": None,
+                 "expiresAt": None},
+                {"type": "pic",
+                 "cover": "https://scontent.example.com/photo2.jpg",
+                 "sourceUrl": "https://scontent.example.com/photo2.jpg",
+                 "size": None, "width": None, "height": None,
+                 "expiresAt": None},
+                {"type": "video",
+                 "cover": "https://scontent.example.com/clip.jpg",
+                 "sourceUrl": "https://scontent.example.com/clip.mp4",
+                 "size": None, "width": None, "height": None,
+                 "expiresAt": None},
+            ],
+            "postList": None, "hasMore": True,
+        },
+        "requestId": "test-request-id",
+    }
+
+    def setUp(self):
+        with server.LOCK:
+            server.META_CACHE.clear()
+            server.JOBS.clear()
+
+    def _image_urls(self, payload, env=None):
+        body = json.dumps(payload).encode('utf-8')
+        opener = _FakeUrlopen([body])
+        with patch('server.urllib.request.urlopen', opener), \
+             patch.dict(os.environ, env or {'RAPIDAPI_KEY': 'test-key'}):
+            return server._fetchsocial_image_urls(self.SHARE_URL), opener
+
+    def test_share_photo_url_detection(self):
+        self.assertTrue(server._is_facebook_share_photo_url(self.SHARE_URL))
+        # fb.com is not accepted (like _gallery_platform, only
+        # facebook.com counts) and a bare /share/ without /p/ is not a
+        # photo share.
+        self.assertFalse(server._is_facebook_share_photo_url(
+            'https://www.fb.com/share/p/abc123/'))
+        self.assertFalse(server._is_facebook_share_photo_url(
+            'https://www.facebook.com/jeremy.koh.5477/posts/10156354288282282'))
+        self.assertFalse(server._is_facebook_share_photo_url(
+            'https://www.facebook.com/photo.php?fbid=10157311924301974'))
+        # A video share is not a photo share.
+        self.assertFalse(server._is_facebook_share_photo_url(
+            'https://www.facebook.com/share/v/abc123/'))
+        self.assertFalse(server._is_facebook_share_photo_url(
+            'https://www.instagram.com/p/Df1U9noDQZX/'))
+
+    def test_no_key_returns_empty_without_calling_api(self):
+        urls, opener = self._image_urls(self.RESPONSE, {'RAPIDAPI_KEY': ''})
+        self.assertEqual(urls, [])
+        self.assertEqual(opener.calls, [])
+
+    def test_returns_pic_urls_only(self):
+        urls, opener = self._image_urls(self.RESPONSE)
+        self.assertEqual(urls, ['https://scontent.example.com/photo1.jpg',
+                                'https://scontent.example.com/photo2.jpg'])
+        self.assertEqual(len(opener.calls), 1)
+        self.assertEqual(opener.calls[0].full_url, server.FETCHSOCIAL_API_URL)
+        # Request.add_header stores keys capitalized, and get_header does
+        # a literal lookup in this Python, so read the dict directly.
+        self.assertEqual(opener.calls[0].headers.get('X-rapidapi-host'),
+                         server.FETCHSOCIAL_HOST)
+        self.assertEqual(opener.calls[0].headers.get('X-rapidapi-key'), 'test-key')
+
+    def test_data_null_returns_empty(self):
+        urls, _ = self._image_urls({"status": 200, "message": "", "data": None})
+        self.assertEqual(urls, [])
+
+    def test_http_429_raises_quota_error(self):
+        err = HTTPError(server.FETCHSOCIAL_API_URL, 429, 'Too Many Requests',
+                        None, None)
+        opener = _FakeUrlopen([err])
+        with patch('server.urllib.request.urlopen', opener), \
+             patch.dict(os.environ, {'RAPIDAPI_KEY': 'test-key'}):
+            with self.assertRaises(ValueError) as cm:
+                server._fetchsocial_image_urls(self.SHARE_URL)
+        self.assertIn('hết lượt miễn phí', str(cm.exception))
+
+    def test_http_401_raises_key_error(self):
+        err = HTTPError(server.FETCHSOCIAL_API_URL, 401, 'Unauthorized',
+                        None, None)
+        opener = _FakeUrlopen([err])
+        with patch('server.urllib.request.urlopen', opener), \
+             patch.dict(os.environ, {'RAPIDAPI_KEY': 'bad-key'}):
+            with self.assertRaises(ValueError) as cm:
+                server._fetchsocial_image_urls(self.SHARE_URL)
+        self.assertIn('key RapidAPI', str(cm.exception))
+
+    def test_http_500_returns_empty(self):
+        err = HTTPError(server.FETCHSOCIAL_API_URL, 500, 'Server Error',
+                        None, None)
+        opener = _FakeUrlopen([err])
+        with patch('server.urllib.request.urlopen', opener), \
+             patch.dict(os.environ, {'RAPIDAPI_KEY': 'test-key'}):
+            self.assertEqual(server._fetchsocial_image_urls(self.SHARE_URL), [])
+
+    def _fetchsocial_job(self, tmp, jid, urls, image_responses):
+        with server.LOCK:
+            server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+        folder = Path(tmp, jid)
+        folder.mkdir(parents=True, exist_ok=True)
+        opener = _FakeUrlopen(image_responses)
+        with patch('server.urllib.request.urlopen', opener), \
+             patch.object(server, '_fetchsocial_image_urls',
+                          return_value=urls):
+            server._download_images_fetchsocial(jid, self.SHARE_URL, folder)
+        with server.LOCK:
+            return dict(server.JOBS[jid])
+
+    def test_download_fetchsocial_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img1 = b'\xff\xd8\xff' + b'one'
+            img2 = b'\xff\xd8\xff' + b'two'
+            job = self._fetchsocial_job(
+                tmp, 'fs1',
+                ['https://scontent.example.com/photo1.jpg',
+                 'https://scontent.example.com/photo2.jpg'],
+                [img1, img2])
+            self.assertEqual(job['status'], 'ready')
+            self.assertEqual(job['found'], 2)
+            self.assertEqual(job['downloaded'], 2)
+            self.assertEqual([Path(p).name for p in job['image_files']],
+                             ['01.jpg', '02.jpg'])
+            self.assertEqual(Path(job['image_files'][0]).read_bytes(), img1)
+
+    def test_download_fetchsocial_no_photos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError) as cm:
+                self._fetchsocial_job(tmp, 'fs2', [], [])
+            self.assertIn('Không tìm thấy ảnh', str(cm.exception))
+
+    def test_download_fetchsocial_partial_warning(self):
+        # One image fails to download; the rest are still returned.
+        with tempfile.TemporaryDirectory() as tmp:
+            img2 = b'\xff\xd8\xff' + b'two'
+            job = self._fetchsocial_job(
+                tmp, 'fs3',
+                ['https://scontent.example.com/photo1.jpg',
+                 'https://scontent.example.com/photo2.jpg'],
+                [urllib.error.URLError('boom'), img2])
+            self.assertEqual(job['status'], 'ready')
+            self.assertEqual(job['found'], 2)
+            self.assertEqual(job['downloaded'], 1)
+            self.assertEqual(job['warning'], 'Chỉ tải được 1/2 ảnh.')
+
+    def _fallback_job(self, tmp, jid, url, simulate, opener, env):
+        with server.LOCK:
+            server.JOBS[jid] = {'created': time.time(), 'status': 'queued'}
+        old_storage = server.STORAGE
+        server.STORAGE = Path(tmp)
+        try:
+            with patch('server.subprocess.run') as run, \
+                 patch('server.urllib.request.urlopen', opener), \
+                 patch.dict(os.environ, env):
+                run.side_effect = simulate
+                server.download_media(jid, url, 'image')
+        finally:
+            server.STORAGE = old_storage
+        with server.LOCK:
+            return dict(server.JOBS[jid])
+
+    def _gallery_fail_simulate(self, probe_rc=1, probe_stderr=''):
+        def simulate(command, **kwargs):
+            if '--get-urls' in command:
+                return type('Result', (), {'returncode': probe_rc, 'stdout': '',
+                                           'stderr': probe_stderr})()
+            return type('Result', (), {'returncode': 1, 'stdout': '', 'stderr': ''})()
+        return simulate
+
+    def _share_chain(self, tmp, jid, url, opener, env):
+        simulate = self._gallery_fail_simulate(
+            probe_stderr="[facebook][error] An unexpected error occurred: KeyError - 'fbid'.")
+        return self._fallback_job(tmp, jid, url, simulate, opener, env)
+
+    def test_gallery_share_link_falls_back_to_fetchsocial(self):
+        # gallery-dl fails, the parser finds no og:image, FetchSocial
+        # returns 2 photos — the job is ready via FetchSocial.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = b'<html><head></head><body>photo</body></html>'
+            api = json.dumps(self.RESPONSE).encode('utf-8')
+            img1 = b'\xff\xd8\xff' + b'one'
+            img2 = b'\xff\xd8\xff' + b'two'
+            opener = _FakeUrlopen([page, api, img1, img2])
+            job = self._share_chain(tmp, 'fs4', self.SHARE_URL, opener,
+                                    {'FB_COOKIES': self.FB_COOKIE_TEXT,
+                                     'RAPIDAPI_KEY': 'test-key'})
+            self.assertEqual(job['status'], 'ready')
+            self.assertEqual(job['found'], 2)
+            self.assertEqual(job['downloaded'], 2)
+            self.assertEqual([Path(p).name for p in job['image_files']],
+                             ['01.jpg', '02.jpg'])
+            self.assertEqual(len(opener.calls), 4)
+            self.assertEqual(opener.calls[1].full_url, server.FETCHSOCIAL_API_URL)
+
+    def test_gallery_share_link_no_key_skips_fetchsocial(self):
+        # Without RAPIDAPI_KEY the parser error propagates and the API
+        # is never called.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = b'<html><head></head><body>photo</body></html>'
+            opener = _FakeUrlopen([page])
+            job = self._share_chain(tmp, 'fs5', self.SHARE_URL, opener,
+                                    {'FB_COOKIES': self.FB_COOKIE_TEXT})
+            self.assertEqual(job['status'], 'error')
+            self.assertTrue(job['error'].startswith(
+                'Không tìm thấy ảnh nào trong bài đăng này.'))
+            self.assertEqual(len(opener.calls), 1)
+
+    def test_gallery_posts_link_skips_fetchsocial(self):
+        # /posts/ links are not /share/p/ links, so FetchSocial is never
+        # called even when a key is set.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = b'<html><head></head><body>photo</body></html>'
+            opener = _FakeUrlopen([page])
+            job = self._share_chain(
+                tmp, 'fs6',
+                'https://www.facebook.com/jeremy.koh.5477/posts/10156354288282282',
+                opener,
+                {'FB_COOKIES': self.FB_COOKIE_TEXT, 'RAPIDAPI_KEY': 'test-key'})
+            self.assertEqual(job['status'], 'error')
+            self.assertTrue(job['error'].startswith(
+                'Không tìm thấy ảnh nào trong bài đăng này.'))
+            self.assertEqual(len(opener.calls), 1)
+
+    def test_fetchsocial_quota_error_surfaces(self):
+        # A key/quota failure from FetchSocial names the real problem,
+        # so it surfaces instead of the parser error.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = b'<html><head></head><body>photo</body></html>'
+            err = HTTPError(server.FETCHSOCIAL_API_URL, 429,
+                            'Too Many Requests', None, None)
+            opener = _FakeUrlopen([page, err])
+            job = self._share_chain(tmp, 'fs7', self.SHARE_URL, opener,
+                                    {'FB_COOKIES': self.FB_COOKIE_TEXT,
+                                     'RAPIDAPI_KEY': 'test-key'})
+            self.assertEqual(job['status'], 'error')
+            self.assertEqual(job['error'],
+                             'FetchSocial: đã hết lượt miễn phí trong tháng.')
+
+    def test_fetchsocial_no_photos_keeps_parser_error(self):
+        # FetchSocial returning data:null is less specific than the
+        # parser error, so the parser error is the one surfaced.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = b'<html><head></head><body>photo</body></html>'
+            api = json.dumps({"status": 200, "data": None}).encode('utf-8')
+            opener = _FakeUrlopen([page, api])
+            job = self._share_chain(tmp, 'fs8', self.SHARE_URL, opener,
+                                    {'FB_COOKIES': self.FB_COOKIE_TEXT,
+                                     'RAPIDAPI_KEY': 'test-key'})
+            self.assertEqual(job['status'], 'error')
+            self.assertTrue(job['error'].startswith(
+                'Không tìm thấy ảnh nào trong bài đăng này.'))
+            self.assertEqual(len(opener.calls), 2)
 
 
 class HttpTests(unittest.TestCase):
