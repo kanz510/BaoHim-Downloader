@@ -920,6 +920,43 @@ def _fetch_facebook_page(url: str, headers: dict, cookie_header: str):
     return page, final_url, status, len(raw)
 
 
+def _resolve_facebook_share_url(url: str) -> str:
+    """Resolve a Facebook share short link (/share/..., /share/v/..., /share/p/...)
+    or fb.watch link to the post's final URL, so yt-dlp can extract it.
+
+    Share links are app-shell pages that redirect client-side; yt-dlp sees
+    only the shell and fails with 'Không đọc được bài đăng'. The parser fetch
+    (with the FB session cookies) follows the server-side redirect and
+    reports the final URL. Returns the original URL unchanged when it is not
+    a share link, when no FB cookies are configured, or when the fetch fails
+    (yt-dlp then tries the original link as before — no worse than the
+    current behaviour)."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower().rstrip(".")
+    path = parts.path or "/"
+    is_share = (host == "facebook.com" or host.endswith(".facebook.com")) and path.startswith("/share/")
+    is_fbwatch = host == "fb.watch" or host.endswith(".fb.watch")
+    if not (is_share or is_fbwatch):
+        return url
+    cookie_file = _gallery_cookie_file("facebook")
+    if not cookie_file:
+        return url
+    try:
+        headers = dict(FB_PARSER_HEADERS)
+        cookie_header = _netscape_cookie_header(cookie_file, url)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        _, final_url, _, _ = _fetch_facebook_page(url, headers, cookie_header)
+        return final_url or url
+    except (ValueError, OSError):
+        return url
+    finally:
+        try:
+            os.unlink(cookie_file)
+        except OSError:
+            pass
+
+
 def _fetch_facebook_image(image_url: str, headers: dict) -> tuple[bytes, str]:
     """Download one Facebook image URL. Returns (data, ext). Raises
     ValueError when the download fails, the file is too big, or the
@@ -1313,7 +1350,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.14"
+    server_version = "HimTik/2.0.15"
     sys_version = ""
 
     def log_message(self, fmt, *args):
@@ -1585,6 +1622,10 @@ class App(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("Dữ liệu yêu cầu không hợp lệ.")
             url = extract_url(payload.get("url", ""))
+            # Facebook share short links (/share/..., fb.watch) are app-shell
+            # pages yt-dlp cannot read; resolve them to the post's final URL
+            # first (no-op for every other link).
+            url = _resolve_facebook_share_url(url)
         except (ValueError, TypeError) as exc:
             return self.json_response(400, {"error": str(exc) or "Dữ liệu không hợp lệ."})
         if route == "/api/inspect":
