@@ -92,6 +92,17 @@ FB_PARSER_HEADERS = {
 # cap, and video posts (the parser would return a video thumbnail).
 _FB_PARSER_SKIP_PREFIXES = ("Bài này cần đăng nhập", "Album quá nhiều ảnh",
                             "Tổng dung lượng", "Bài đăng này là video")
+# FetchSocial (RapidAPI) fallback for Facebook photo links (2.0.14):
+# gallery-dl and the og:image parser cannot read Facebook photo posts
+# (their data loads via GraphQL after the page loads). FetchSocial's
+# free Basic plan (50 req/month) returns the post's photos — but only
+# for /share/p/ links: /posts/ and photo.php return data:null (verified
+# 2026-11-19 against the live API). The key lives in the RAPIDAPI_KEY
+# env var on Render (set in the dashboard, never in the repo or chat).
+FETCHSOCIAL_API_URL = ("https://fetchsocial-all-in-one-scraper.p.rapidapi.com"
+                       "/openapi/rapidapi/v1/video")
+FETCHSOCIAL_HOST = "fetchsocial-all-in-one-scraper.p.rapidapi.com"
+FETCHSOCIAL_TIMEOUT = 30
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp")
 IMAGE_CONTENT_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                        ".webp": "image/webp", ".gif": "image/gif",
@@ -1013,6 +1024,91 @@ def _download_images_facebook_parser(job_id: str, url: str, folder: Path,
             job["warning"] = f"Chỉ tải được {len(image_files)}/{len(fbids)} ảnh."
 
 
+def _is_facebook_share_photo_url(url: str) -> bool:
+    """True for Facebook /share/p/ links — the only URL format
+    FetchSocial can read photos from (verified 2026-11-19: /posts/ and
+    photo.php return data:null)."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host != "facebook.com" and not host.endswith(".facebook.com"):
+        return False
+    return "/share/p/" in urlsplit(url).path
+
+
+def _fetchsocial_image_urls(url: str) -> list[str]:
+    """Call FetchSocial (RapidAPI) for a Facebook share link and return
+    the post's photo URLs (downloadUrlList, type 'pic'). Returns [] when
+    the key is unset, the call fails, or the post has no photos. The
+    author's avatar (a separate 'avatar' field) is never included.
+    Raises ValueError when the key is rejected or the free quota is
+    exhausted, so the caller can say so plainly."""
+    api_key = os.environ.get("RAPIDAPI_KEY", "")
+    if not api_key.strip():
+        return []
+    body = json.dumps({"url": url}).encode("utf-8")
+    request = urllib.request.Request(
+        FETCHSOCIAL_API_URL, data=body,
+        headers={"Content-Type": "application/json",
+                 "X-RapidAPI-Key": api_key,
+                 "X-RapidAPI-Host": FETCHSOCIAL_HOST},
+        method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=FETCHSOCIAL_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise ValueError("FetchSocial: key RapidAPI không hợp lệ hoặc hết hạn.")
+        if exc.code == 429:
+            raise ValueError("FetchSocial: đã hết lượt miễn phí trong tháng.")
+        return []
+    except (urllib.error.URLError, OSError, ValueError):
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return []
+    urls = []
+    for item in data.get("downloadUrlList") or []:
+        if not isinstance(item, dict) or item.get("type") != "pic":
+            continue
+        link = item.get("sourceUrl") or item.get("cover")
+        if isinstance(link, str) and link.startswith("http"):
+            urls.append(link)
+    return urls
+
+
+def _download_images_fetchsocial(job_id: str, url: str, folder: Path) -> None:
+    """Facebook photo fallback via FetchSocial (RapidAPI): ask the API
+    for the post's photo URLs and download each one. Only used for
+    /share/p/ links (the only format FetchSocial reads). A failed image
+    is skipped and the rest are still returned (found/downloaded/
+    warning on the job). Raises ValueError on any failure."""
+    image_urls = _fetchsocial_image_urls(url)
+    if not image_urls:
+        raise ValueError("Không tìm thấy ảnh nào trong bài đăng này.")
+    if len(image_urls) > MAX_GALLERY_IMAGES:
+        raise ValueError(f"Album quá nhiều ảnh (tối đa {MAX_GALLERY_IMAGES} ảnh).")
+    image_files = []
+    total_bytes = 0
+    for index, image_url in enumerate(image_urls, start=1):
+        try:
+            data, ext = _fetch_facebook_image(image_url, dict(FB_PARSER_HEADERS))
+        except ValueError:
+            continue
+        target = folder / f"{index:02d}{ext}"
+        target.write_bytes(data)
+        image_files.append(str(target))
+        total_bytes += len(data)
+    if not image_files:
+        raise ValueError("Không tải được ảnh từ bài đăng này.")
+    if not 0 < total_bytes <= MAX_BYTES:
+        raise ValueError("Tổng dung lượng ảnh vượt 120 MB.")
+    with LOCK:
+        job = JOBS[job_id]
+        job.update(status="ready", bytes=total_bytes, found=len(image_urls),
+                   downloaded=len(image_files), image_files=image_files)
+        if len(image_files) < len(image_urls):
+            job["warning"] = f"Chỉ tải được {len(image_files)}/{len(image_urls)} ảnh."
+
+
 def _download_images_gallery(job_id: str, url: str, folder: Path) -> None:
     """Instagram/Facebook photo posts via gallery-dl.
 
@@ -1088,25 +1184,41 @@ def _download_images_gallery(job_id: str, url: str, folder: Path) -> None:
                     job["warning"] = warning
                 job["image_files"] = renamed
         except ValueError as exc:
-            # Facebook fallback: gallery-dl's extractor cannot parse some
-            # photo pages. Try the og:image parser when FB cookies are
-            # configured; login/cap/size/video failures are re-raised as-is.
-            # The parser's own error propagates (it is the most specific
+            # Facebook fallback chain: the og:image parser (needs FB
+            # cookies), then FetchSocial (needs RAPIDAPI_KEY, only
+            # /share/p/ links — the only format it reads photos from).
+            # Login/cap/size/video failures are re-raised as-is. The
+            # parser's own error propagates (it is the most specific
             # one: it says whether the page, the og:image, or the image
-            # download failed) instead of the generic gallery-dl error.
+            # download failed) unless FetchSocial reports a key/quota
+            # failure, which names the real problem.
             message = str(exc)
-            if (platform == "facebook" and cookie_file
-                    and not message.startswith(_FB_PARSER_SKIP_PREFIXES)):
+            if platform == "facebook" and not message.startswith(_FB_PARSER_SKIP_PREFIXES):
                 gallery_log = ""
                 if os.environ.get("HIMTIK_FB_DEBUG"):
                     gallery_log = _gallery_verbose_log(url, cookie_file)
-                try:
-                    _download_images_facebook_parser(job_id, url, folder, cookie_file)
-                except ValueError as parser_exc:
-                    if gallery_log:
-                        raise ValueError(f"{parser_exc} [gallery-dl -v: {gallery_log}]")
-                    raise
-                return
+                fallback_error = None
+                parser_failed = False
+                if cookie_file:
+                    try:
+                        _download_images_facebook_parser(job_id, url, folder, cookie_file)
+                        return
+                    except ValueError as parser_exc:
+                        fallback_error = parser_exc
+                        parser_failed = True
+                if (_is_facebook_share_photo_url(url)
+                        and os.environ.get("RAPIDAPI_KEY", "").strip()):
+                    try:
+                        _download_images_fetchsocial(job_id, url, folder)
+                        return
+                    except ValueError as fetch_exc:
+                        if str(fetch_exc).startswith("FetchSocial:"):
+                            fallback_error = fetch_exc
+                            parser_failed = False
+                if fallback_error is not None:
+                    if gallery_log and parser_failed:
+                        raise ValueError(f"{fallback_error} [gallery-dl -v: {gallery_log}]")
+                    raise fallback_error
             raise
     finally:
         if cookie_file:
@@ -1201,7 +1313,7 @@ class App(BaseHTTPRequestHandler):
     # response closes its connection. That is what makes a rejected POST
     # harmless: unread request bytes can never leak into a following request
     # on a reused socket (the HTTP 501 class of bug fixed in V3.0.1).
-    server_version = "HimTik/2.0.13"
+    server_version = "HimTik/2.0.14"
     sys_version = ""
 
     def log_message(self, fmt, *args):
