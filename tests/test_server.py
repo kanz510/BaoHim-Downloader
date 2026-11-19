@@ -1404,6 +1404,65 @@ class FetchSocialTests(unittest.TestCase):
             self.assertEqual(len(opener.calls), 2)
 
 
+class ShareLinkResolveTests(unittest.TestCase):
+    """Resolve Facebook share short links to the post's final URL (2.0.15).
+
+    /share/... and fb.watch links are app-shell pages yt-dlp cannot read;
+    the parser fetch (with the FB session cookies) follows the server-side
+    redirect and reports the final URL, which yt-dlp can extract."""
+
+    FB_COOKIE_TEXT = FacebookParserTests.FB_COOKIE_TEXT
+    SHARE_V = 'https://www.facebook.com/share/v/19imTQTzeL/?mibextid=wwXIfr'
+    SHARE_P = 'https://www.facebook.com/share/p/19sDYNzoaC/'
+    REEL = 'https://www.facebook.com/reel/1677932077295478/'
+
+    def _resolve(self, url, opener, env=None):
+        env = env if env is not None else {'FB_COOKIES': self.FB_COOKIE_TEXT}
+        with patch('server.urllib.request.urlopen', opener), \
+                patch.dict(os.environ, env, clear=False):
+            return server._resolve_facebook_share_url(url)
+
+    def test_share_v_resolves_to_reel(self):
+        page = b'<html><head></head><body>video</body></html>'
+        opener = _FakeUrlopen([_FakeHTTPResponse(page, url=self.REEL)])
+        self.assertEqual(self._resolve(self.SHARE_V, opener), self.REEL)
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_share_p_resolves(self):
+        page = b'<html><head></head><body>photo</body></html>'
+        post = 'https://www.facebook.com/fallinluv2003/posts/480547719828045'
+        opener = _FakeUrlopen([_FakeHTTPResponse(page, url=post)])
+        self.assertEqual(self._resolve(self.SHARE_P, opener), post)
+
+    def test_fb_watch_resolves(self):
+        page = b'<html><head></head><body>video</body></html>'
+        opener = _FakeUrlopen([_FakeHTTPResponse(page, url=self.REEL)])
+        self.assertEqual(
+            self._resolve('https://fb.watch/abc123/', opener), self.REEL)
+
+    def test_direct_reel_link_unchanged(self):
+        opener = _FakeUrlopen([])
+        self.assertEqual(self._resolve(self.REEL, opener), self.REEL)
+        self.assertEqual(len(opener.calls), 0)
+
+    def test_non_facebook_link_unchanged(self):
+        opener = _FakeUrlopen([])
+        url = 'https://www.tiktok.com/@x/video/123'
+        self.assertEqual(self._resolve(url, opener), url)
+        self.assertEqual(len(opener.calls), 0)
+
+    def test_no_cookies_returns_original(self):
+        opener = _FakeUrlopen([])
+        self.assertEqual(self._resolve(self.SHARE_V, opener,
+                                       env={'FB_COOKIES': ''}),
+                         self.SHARE_V)
+        self.assertEqual(len(opener.calls), 0)
+
+    def test_fetch_failure_returns_original(self):
+        opener = _FakeUrlopen([urllib.error.URLError('boom')])
+        self.assertEqual(self._resolve(self.SHARE_V, opener), self.SHARE_V)
+
+
 class HttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
